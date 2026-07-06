@@ -601,39 +601,6 @@ def _ragas_color(value):
     return "#4CAF50" if value >= 0.8 else ("#FF9800" if value >= 0.5 else "#F44336")
 
 
-def _latency_color(seconds):
-    if seconds is None:
-        return "#666666"
-    return "#4CAF50" if seconds < 5 else ("#FF9800" if seconds < 15 else "#F44336")
-
-
-def _metric_card_html(label: str, display: str, color: str) -> str:
-    return (
-        f'<div class="ragas-card"><div style="font-size:20px;font-weight:600;color:{color};">'
-        f'{display}</div><div style="font-size:10px;color:#888;text-transform:uppercase;'
-        f'letter-spacing:.05em;margin-top:3px;">{label}</div></div>'
-    )
-
-
-def _pipeline_metrics_html(msg: dict) -> str:
-    confidence    = msg.get("intent_confidence", 0.0)
-    latency_s     = msg.get("llm_latency_ms", 0.0) / 1000
-    input_tokens  = msg.get("input_tokens", 0)
-    output_tokens = msg.get("output_tokens", 0)
-
-    cards = "".join([
-        _metric_card_html("Intent Confidence", f"{confidence:.0%}", _ragas_color(confidence)),
-        _metric_card_html("LLM Latency", f"{latency_s:.2f}s", _latency_color(latency_s)),
-        _metric_card_html("Input Tokens", f"{input_tokens:,}", "#F5C518"),
-        _metric_card_html("Output Tokens", f"{output_tokens:,}", "#F5C518"),
-    ])
-    return (
-        '<div style="font-size:10px;color:#888;font-weight:600;text-transform:uppercase;'
-        'letter-spacing:.06em;margin:8px 0 6px;">Pipeline metrics</div>'
-        f'<div style="display:flex;gap:10px;margin-bottom:4px;">{cards}</div>'
-    )
-
-
 def _ragas_metrics_html(score) -> str:
     metrics = [
         ("Faithfulness", score.faithfulness),
@@ -1090,8 +1057,6 @@ elif st.session_state.screen == "chat":
                 st.markdown(f'<div style="margin-top:8px;">{chips}</div>', unsafe_allow_html=True)
 
             if msg["role"] == "assistant":
-                st.markdown(_pipeline_metrics_html(msg), unsafe_allow_html=True)
-
                 st.markdown('<div class="eval-btn">', unsafe_allow_html=True)
                 if st.button(
                     "📊 Evaluate (RAGAS · GPT-4o mini)",

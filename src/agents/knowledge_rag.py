@@ -1,25 +1,48 @@
+"""
+knowledge_rag.py — Production-ready single-hop RAG pipeline.
+
+Flow: Question → Hybrid Retrieve (BM25 + Dense) → Cross-encoder Rerank → LLM Answer
+
+Graceful degradation:
+  - rank_bm25 / sentence-transformers missing → dense-only FAISS fallback
+  - Reranker fails at runtime                 → returns un-reranked candidates
+  - LLM returns empty                         → safe fallback message
+"""
+
 import logging
+import time
+from typing import Optional
 
 from langchain_core.documents import Document
 from openai import OpenAI
 
-from docs.vector_store import FAISSVectorStore
+from src.observability.langsmith import traceable_operation
 
 logger = logging.getLogger(__name__)
 
-# Optional enhanced retrieval — gracefully degrades if deps not installed.
-# Catches Exception (not just ImportError) because a broken PyTorch install
-# raises OSError / WinError 1114 when the DLL fails to load, which ImportError
-# does not cover.
+# ---------------------------------------------------------------------------
+# Optional hybrid retrieval — graceful degradation if deps absent
+# ---------------------------------------------------------------------------
 try:
     from src.agents.retriever import build_hybrid_retriever, rerank as _rerank
     _HYBRID_AVAILABLE = True
-except Exception:
+    logger.info("KnowledgeRAG: hybrid retrieval (BM25 + dense + rerank) enabled.")
+except ImportError:
     _HYBRID_AVAILABLE = False
-    logger.info(
-        "rank_bm25 / sentence-transformers not available or failed to load; "
-        "KnowledgeRAG falling back to dense-only retrieval."
+    logger.warning(
+        "KnowledgeRAG: rank_bm25 / sentence-transformers not installed. "
+        "Falling back to dense-only Pinecone retrieval. "
+        "Install with: pip install rank_bm25 sentence-transformers"
     )
+
+
+_SYSTEM_PROMPT = (
+    "You are a precise contract knowledge assistant. "
+    "Answer the user's question using ONLY the provided context. "
+    "For EVERY factual claim you make, include an inline citation in the exact "
+    "format [doc_id, page]. "
+    "If the context does not contain the answer, say so explicitly — do not guess."
+)
 
 
 def _extract_response_text(response) -> str:
@@ -28,56 +51,113 @@ def _extract_response_text(response) -> str:
     if getattr(response, "output", None):
         for item in response.output:
             if getattr(item, "type", None) == "message":
-                for content_item in getattr(item, "content", []) or []:
-                    if getattr(content_item, "type", None) == "output_text":
-                        return getattr(content_item, "text", "")
+                for block in getattr(item, "content", []) or []:
+                    if getattr(block, "type", None) == "output_text":
+                        return getattr(block, "text", "")
     return ""
 
 
-_SYSTEM_PROMPT = (
-    "You are a precise contract knowledge assistant. "
-    "Answer the user's question using ONLY the provided context. "
-    "For EVERY factual claim you make, include an inline citation in the exact format [doc_id, page]. "
-    "If the context does not contain the answer, say so explicitly — do not guess."
-)
+def _extract_usage(response) -> dict:
+    usage = getattr(response, "usage", None)
+    if usage is None:
+        return {"input_tokens": 0, "output_tokens": 0}
+    return {
+        "input_tokens":  getattr(usage, "input_tokens", 0) or 0,
+        "output_tokens": getattr(usage, "output_tokens", 0) or 0,
+    }
+
+
+def _build_context(docs: list[Document]) -> str:
+    if not docs:
+        return "No relevant documents were retrieved."
+    parts = []
+    for doc in docs:
+        if isinstance(doc, dict):
+            meta = doc.get("metadata") or {}
+            content = str(doc.get("content") or "").strip()
+            filename = meta.get("filename") or meta.get("source") or "document"
+            page = meta.get("page")
+            header = f"[doc_id={meta.get('doc_id', 'unknown')}, page={page if page is not None else '?'}, file={filename}]"
+            parts.append(f"{header}\n{content}")
+            continue
+
+        meta = getattr(doc, "metadata", None) or {}
+        header = (
+            f"[doc_id={meta.get('doc_id', 'unknown')}, "
+            f"page={meta.get('page', '?')}, "
+            f"file={meta.get('filename') or meta.get('source', 'document')}]"
+        )
+        parts.append(f"{header}\n{getattr(doc, 'page_content', '').strip()}")
+    return "\n\n---\n\n".join(parts)
+
+
+def _docs_to_sources(docs: list[Document]) -> list[dict]:
+    sources = []
+    for doc in docs:
+        if isinstance(doc, dict):
+            meta = doc.get("metadata") or {}
+            filename = meta.get("filename") or meta.get("source") or "document"
+            page = meta.get("page")
+            sources.append({
+                "doc_id": meta.get("doc_id"),
+                "page": page,
+                "filename": filename,
+                "display": f"{filename} (page {page})" if page is not None else filename,
+            })
+            continue
+
+        meta = getattr(doc, "metadata", None) or {}
+        filename = meta.get("filename") or meta.get("source") or "document"
+        page = meta.get("page")
+        sources.append({
+            "doc_id": meta.get("doc_id"),
+            "page": page,
+            "filename": filename,
+            "display": f"{filename} (page {page})" if page is not None else filename,
+        })
+    return sources
 
 
 class KnowledgeRAG:
     """
-    Single-hop RAG branch: Question -> Retrieve -> Answer.
+    Production-ready single-hop RAG pipeline.
 
-    Retrieval strategy (when enhanced deps are installed):
-      - Hybrid BM25 + dense (EnsembleRetriever, 0.4 / 0.6)
-      - Cross-encoder rerank: top-20 candidates -> top-5
-    Falls back to dense-only if rank_bm25 / sentence-transformers are absent.
-
-    Interface expected by chat.py: retrieve(query) -> docs,
-    answer(query, source_payload, history) -> str,
-    run(query, history) -> dict.
+    Retrieval (best-available strategy):
+        Hybrid  → EnsembleRetriever (BM25 + dense, configurable weights)
+                  then cross-encoder rerank: k_initial candidates → k_final
+        Fallback → FAISS similarity_search when hybrid deps are absent
     """
 
     def __init__(
         self,
         client: OpenAI,
-        vector_store: FAISSVectorStore,
-        top_k: int = 5,
+        vector_store,
         model: str = "gpt-4o",
         k_initial: int = 20,
+        k_final: int | None = None,
         bm25_weight: float = 0.4,
         dense_weight: float = 0.6,
+        max_output_tokens: int = 600,
+        temperature: float = 0.0,
+        top_k: int | None = None,
     ):
         self.client = client
         self.vector_store = vector_store
-        self.top_k = top_k
         self.model = model
         self.k_initial = k_initial
+        self.k_final = k_final if k_final is not None else (top_k if top_k is not None else 5)
         self.bm25_weight = bm25_weight
         self.dense_weight = dense_weight
+        self.max_output_tokens = max_output_tokens
+        self.temperature = temperature
+        self.last_usage = {"input_tokens": 0, "output_tokens": 0}
 
-    # ------------------------------------------------------------------
-    # Retrieve
-    # ------------------------------------------------------------------
-    def retrieve(self, query: str) -> list:
+    @traceable_operation(
+        name="KnowledgeRAG retrieval",
+        tags=["knowledge_rag", "retrieval"],
+        metadata={"component": "knowledge_rag"},
+    )
+    def retrieve(self, query: str) -> tuple[list[Document], str]:
         if _HYBRID_AVAILABLE:
             try:
                 retriever = build_hybrid_retriever(
@@ -87,30 +167,36 @@ class KnowledgeRAG:
                     dense_weight=self.dense_weight,
                 )
                 candidates = retriever.invoke(query)
-                return _rerank(query, candidates, top_n=self.top_k)
+                docs = _rerank(query, candidates, top_n=self.k_final)
+                logger.debug(
+                    "KnowledgeRAG: hybrid retrieval returned %d docs for query: %.80s",
+                    len(docs), query,
+                )
+                return docs, "hybrid"
             except Exception as exc:
-                logger.warning("Hybrid retrieval failed (%s); falling back to dense.", exc)
+                logger.warning(
+                    "KnowledgeRAG: hybrid retrieval failed (%s); falling back to dense.", exc
+                )
 
-        docs = self.vector_store.similarity_search(query=query, k=self.top_k)
+        docs = self.vector_store.similarity_search(query=query, k=self.k_final)
         if not docs:
-            logger.info("KnowledgeRAG: no documents retrieved for query: %s", query)
-        return docs
+            logger.info("KnowledgeRAG: no documents retrieved for query: %.80s", query)
+        else:
+            logger.debug("KnowledgeRAG: dense retrieval returned %d docs.", len(docs))
+        return docs, "dense"
 
-    # ------------------------------------------------------------------
-    # Answer
-    # ------------------------------------------------------------------
-    @staticmethod
-    def _build_context(source_payload: list[dict]) -> str:
-        if not source_payload:
-            return "No relevant documents were retrieved."
-        return "\n\n---\n\n".join(
-            f"[doc_id={item.get('doc_id', 'unknown')}, page={item.get('page', '?')}, "
-            f"file={item.get('source', 'document')}]\n{item['content']}"
-            for item in source_payload
-        )
-
-    def answer(self, query: str, source_payload: list[dict], history: str | None = None) -> str:
-        context = self._build_context(source_payload)
+    @traceable_operation(
+        name="KnowledgeRAG answer",
+        tags=["knowledge_rag", "llm"],
+        metadata={"component": "knowledge_rag"},
+    )
+    def answer(
+        self,
+        query: str,
+        docs: list[Document],
+        history: Optional[str] = None,
+    ) -> str:
+        context = _build_context(docs)
         history_section = f"Previous conversation:\n{history}\n\n" if history else ""
 
         user_prompt = (
@@ -119,134 +205,48 @@ class KnowledgeRAG:
             f"Question: {query}\n"
             "Answer (cite every claim as [doc_id, page]):"
         )
-        response = self.client.responses.create(
-            model=self.model,
-            input=[
-                {"role": "system", "content": _SYSTEM_PROMPT},
-                {"role": "user", "content": user_prompt},
-            ],
-            temperature=0.0,
-            max_output_tokens=600,
-        )
+
+        try:
+            response = self.client.responses.create(
+                model=self.model,
+                input=[
+                    {"role": "system", "content": _SYSTEM_PROMPT},
+                    {"role": "user",   "content": user_prompt},
+                ],
+                temperature=self.temperature,
+                max_output_tokens=self.max_output_tokens,
+            )
+        except Exception as exc:
+            logger.error("KnowledgeRAG: LLM call failed for query: %.80s — %s", query, exc)
+            raise
+
+        self.last_usage = _extract_usage(response)
         answer_text = _extract_response_text(response).strip()
         if not answer_text:
-            logger.warning("KnowledgeRAG: empty response from model for query: %s", query)
+            logger.warning("KnowledgeRAG: empty response from model for query: %.80s", query)
             return "I couldn't generate an answer from the retrieved documents."
+
         return answer_text
 
-    # ------------------------------------------------------------------
-    # run — full branch in one call
-    # ------------------------------------------------------------------
-    def run(self, query: str, history: str | None = None) -> dict:
-        docs = self.retrieve(query)
-        source_payload = []
-        for doc in docs:
-            metadata = doc.metadata or {}
-            source_name = metadata.get("filename") or metadata.get("source") or "document"
-            page_number = metadata.get("page")
-            if page_number is not None:
-                source_name = f"{source_name} (page {page_number})"
-            source_payload.append({
-                "source":  source_name,
-                "doc_id":  metadata.get("doc_id"),
-                "page":    page_number,
-                "content": doc.page_content.strip(),
-            })
+    def run(self, query: str, history: Optional[str] = None) -> dict:
+        t0 = time.perf_counter()
 
-        answer_text = self.answer(query, source_payload, history)
-        return {"answer": answer_text, "docs": docs, "sources": source_payload}
+        docs, retrieval_mode = self.retrieve(query)
+        answer_text = self.answer(query, docs, history)
 
-
-# ---------------------------------------------------------------------------
-# EnhancedKnowledgeRAG — dev/notebook class (always uses hybrid + reranking)
-# ---------------------------------------------------------------------------
-
-class EnhancedKnowledgeRAG:
-    """
-    Notebook / evaluation variant. Always uses hybrid BM25+dense retrieval
-    and cross-encoder reranking. Returns structured sources with doc_id + page.
-
-    Use KnowledgeRAG in production (graceful fallback); use this in notebooks
-    when you want explicit control over every knob.
-    """
-
-    def __init__(
-        self,
-        client: OpenAI,
-        vector_store: FAISSVectorStore,
-        model: str = "gpt-4o",
-        k_initial: int = 20,
-        k_final: int = 5,
-        bm25_weight: float = 0.4,
-        dense_weight: float = 0.6,
-    ):
-        self.client = client
-        self.vector_store = vector_store
-        self.model = model
-        self.k_initial = k_initial
-        self.k_final = k_final
-        self.bm25_weight = bm25_weight
-        self.dense_weight = dense_weight
-
-    def retrieve(self, query: str) -> list[Document]:
-        from src.agents.retriever import build_hybrid_retriever, rerank
-        retriever = build_hybrid_retriever(
-            self.vector_store,
-            k=self.k_initial,
-            bm25_weight=self.bm25_weight,
-            dense_weight=self.dense_weight,
+        latency_ms = (time.perf_counter() - t0) * 1000
+        logger.info(
+            "KnowledgeRAG.run | query=%.80s | mode=%s | docs=%d | latency=%.1fms",
+            query, retrieval_mode, len(docs), latency_ms,
         )
-        candidates = retriever.invoke(query)
-        return rerank(query, candidates, top_n=self.k_final)
 
-    @staticmethod
-    def _build_context(docs: list[Document]) -> str:
-        if not docs:
-            return "No relevant documents were retrieved."
-        parts = []
-        for doc in docs:
-            meta = doc.metadata or {}
-            parts.append(
-                f"[doc_id={meta.get('doc_id', 'unknown')}, page={meta.get('page', '?')}, "
-                f"file={meta.get('filename', 'document')}]\n{doc.page_content.strip()}"
-            )
-        return "\n\n---\n\n".join(parts)
-
-    def answer(self, query: str, docs: list[Document], history: str | None = None) -> dict:
-        context = self._build_context(docs)
-        history_section = f"Previous conversation:\n{history}\n\n" if history else ""
-        user_prompt = (
-            f"{history_section}"
-            f"Context:\n{context}\n\n"
-            f"Question: {query}\n"
-            "Answer (cite every claim as [doc_id, page]):"
-        )
-        response = self.client.responses.create(
-            model=self.model,
-            input=[
-                {"role": "system", "content": _SYSTEM_PROMPT},
-                {"role": "user", "content": user_prompt},
-            ],
-            temperature=0.0,
-            max_output_tokens=600,
-        )
-        answer_text = _extract_response_text(response).strip()
-        if not answer_text:
-            logger.warning("EnhancedKnowledgeRAG: empty model response for: %s", query)
-            answer_text = "I couldn't generate an answer from the retrieved documents."
-
-        sources = [
-            {
-                "doc_id":   (doc.metadata or {}).get("doc_id"),
-                "page":     (doc.metadata or {}).get("page"),
-                "filename": (doc.metadata or {}).get("filename"),
-            }
-            for doc in docs
-        ]
-        return {"answer": answer_text, "sources": sources}
-
-    def run(self, query: str, history: str | None = None) -> dict:
-        docs = self.retrieve(query)
-        result = self.answer(query, docs, history)
-        result["docs"] = docs
-        return result
+        return {
+            "answer":  answer_text,
+            "sources": _docs_to_sources(docs),
+            "docs":    docs,
+            "meta": {
+                "retrieval_mode": retrieval_mode,
+                "docs_retrieved": len(docs),
+                "latency_ms":     round(latency_ms, 2),
+            },
+        }

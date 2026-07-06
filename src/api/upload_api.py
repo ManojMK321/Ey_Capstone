@@ -11,10 +11,9 @@ from fastapi.responses import StreamingResponse
 from src.schema.validation import UploadedFile, UploadResponse
 from src.retrieval.blob_storage import upload_blob, list_blobs, delete_blob, blob_exists
 from src.retrieval.doc_registry import register_document
-from docs.parser import PDFParser
-from docs.chunking import DocumentChunker
-from docs.vector_store import FAISSVectorStore
-from docs.pipeline import get_pipeline
+from src.orchestrator.session_store_postgres import session_store
+from src.observability.langsmith import traceable_operation
+from docs.pipeline import get_pipeline, get_vector_store
 
 logger = logging.getLogger(__name__)
 
@@ -32,8 +31,6 @@ MAX_FILE_SIZE         = MAX_FILE_SIZE_MB * 1024 * 1024
 MAX_FILES             = 10
 
 TEMP_DIR.mkdir(parents=True, exist_ok=True)
-
-# Shared pipeline singleton lives in docs/pipeline.py
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -58,10 +55,36 @@ async def read_upload(file: UploadFile) -> tuple[bytes, int]:
     return data, len(data)
 
 
+def normalize_session_id(session_id: str) -> str | None:
+    """Strip whitespace and validate the session_id is a well-formed UUID."""
+    if not session_id:
+        return None
+    cleaned = session_id.strip()
+    try:
+        uuid.UUID(cleaned)
+        return cleaned
+    except ValueError:
+        return None
+
+
+def _resolve_session(raw_id: str | None) -> str:
+    """
+    Resolve or create a session from a raw session ID string.
+    Calls make_session so callers always get a valid session_id back.
+    """
+    normalized = normalize_session_id(raw_id or "")
+    return session_store.make_session(normalized, reset=False)
+
+
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
 
+@traceable_operation(
+    name="Upload documents",
+    tags=["api", "upload"],
+    metadata={"endpoint": "/upload/"},
+)
 @router.post(
     "/",
     response_model=UploadResponse,
@@ -87,8 +110,11 @@ async def read_upload(file: UploadFile) -> tuple[bytes, int]:
     },
 )
 async def upload_documents(request: Request) -> UploadResponse:
-    form  = await request.form()
-    files = form.getlist("files")
+    form       = await request.form()
+    files      = form.getlist("files")
+    # Accept session_id from form data or X-Session-ID header
+    raw_session = str(form.get("session_id") or "") or request.headers.get("X-Session-ID", "")
+    session_id  = _resolve_session(raw_session)
 
     if not files:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No files provided.")
@@ -127,25 +153,31 @@ async def upload_documents(request: Request) -> UploadResponse:
             chunk_count = len(chunks)
             logger.info("Generated %d chunk(s) from '%s'.", chunk_count, file.filename)
 
-            # ── 5. Embed & store in FAISS ─────────────────────────────
+            # ── 5. Embed & store in Pinecone ──────────────────────────
             vector_store.add_documents(chunks)
-            logger.info("Stored %d chunks in FAISS for doc_id '%s'.", len(chunks), file_id)
+            logger.info("Stored %d chunks in Pinecone for doc_id '%s'.", chunk_count, file_id)
 
-            # ── 6. Upload to Azure Blob Storage ───────────────────────
+            # ── 6. Upload to Azure Blob Storage (optional) ────────────
             # blob_name = f"{stem}_{file_id}.pdf"
             # blob_url  = upload_blob(blob_name, data)
             # logger.info("Uploaded to blob: %s", blob_url)
-            blob_url = ""
 
             # ── 7. Delete local temp file ─────────────────────────────
-            # temp_path.unlink()
-            # logger.info("Deleted local temp file: %s", temp_path)
-            # temp_path = None
+            temp_path.unlink(missing_ok=True)
+            logger.info("Deleted local temp file: %s", temp_path)
+            temp_path = None
+
+            # ── 8. Register in session ────────────────────────────────
+            session_store.add_document(
+                session_id=session_id,
+                file_id=file_id,
+                original_name=file.filename,
+                size_bytes=size,
+            )
 
             uploaded.append(UploadedFile(
                 file_id       = file_id,
                 original_name = file.filename,
-                blob_url      = blob_url,
                 size_bytes    = size,
                 page_count    = page_count,
                 chunk_count   = chunk_count,
@@ -165,13 +197,14 @@ async def upload_documents(request: Request) -> UploadResponse:
             logger.error("Unexpected error for '%s': %s", file.filename, ex, exc_info=True)
             errors.append({"filename": file.filename, "reason": "An unexpected error occurred."})
 
-        # finally:
-        #     if temp_path and temp_path.exists():
-        #         temp_path.unlink(missing_ok=True)
+        finally:
+            if temp_path and temp_path.exists():
+                temp_path.unlink(missing_ok=True)
 
     logger.info("Upload complete — %d succeeded, %d failed.", len(uploaded), len(errors))
 
     return UploadResponse(
+        session_id     = session_id,
         message        = f"{len(uploaded)} file(s) uploaded successfully.",
         uploaded_count = len(uploaded),
         failed_count   = len(errors),
@@ -180,14 +213,21 @@ async def upload_documents(request: Request) -> UploadResponse:
     )
 
 
+@traceable_operation(
+    name="Upload stream",
+    tags=["api", "upload", "stream"],
+    metadata={"endpoint": "/upload/stream"},
+)
 @router.post("/stream", summary="Upload one PDF and stream pipeline progress via SSE")
 async def upload_stream(request: Request):
     """
     Streams Server-Sent Events (text/event-stream) so the UI can animate
-    each pipeline step as it completes.  Handles exactly one file per request.
+    each pipeline step as it completes. Handles exactly one file per request.
     """
-    form  = await request.form()
-    files = form.getlist("files")
+    form       = await request.form()
+    files      = form.getlist("files")
+    raw_session = str(form.get("session_id") or "") or request.headers.get("X-Session-ID", "")
+    session_id  = _resolve_session(raw_session)
 
     if not files:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="No file provided.")
@@ -238,7 +278,7 @@ async def upload_stream(request: Request):
             yield f"data: {json.dumps({'step': 3, 'status': 'running'})}\n\n"
             await asyncio.sleep(0)
             vector_store.add_documents(chunks)
-            logger.info("Stored %d chunks in FAISS for doc_id '%s'.", chunk_count, file_id)
+            logger.info("Stored %d chunks in Pinecone vector database for doc_id '%s'.", chunk_count, file_id)
             yield f"data: {json.dumps({'step': 3, 'status': 'done'})}\n\n"
             await asyncio.sleep(0)
 
@@ -248,20 +288,26 @@ async def upload_stream(request: Request):
             yield f"data: {json.dumps({'step': 5, 'status': 'done'})}\n\n"
             await asyncio.sleep(0)
 
-            result = {
-                "file_id":       file_id,
-                "original_name": file.filename,
-                "blob_url":      "",
-                "size_bytes":    size,
-                "page_count":    page_count,
-                "chunk_count":   chunk_count,
-            }
+            session_store.add_document(
+                session_id=session_id,
+                file_id=file_id,
+                original_name=file.filename,
+                size_bytes=size,
+            )
             register_document(
                 file_id=file_id,
                 original_name=file.filename,
                 page_count=page_count,
                 chunk_count=chunk_count,
             )
+
+            result = {
+                "file_id":       file_id,
+                "original_name": file.filename,
+                "size_bytes":    size,
+                "page_count":    page_count,
+                "chunk_count":   chunk_count,
+            }
             logger.info("Stream upload complete: %s (%d chunks)", file.filename, chunk_count)
             yield f"data: {json.dumps({'done': True, 'file': result})}\n\n"
 
@@ -273,6 +319,10 @@ async def upload_stream(request: Request):
             logger.error("Stream upload error: %s", ex, exc_info=True)
             yield f"data: {json.dumps({'error': 'An unexpected error occurred.'})}\n\n"
 
+        finally:
+            if temp_path and temp_path.exists():
+                temp_path.unlink(missing_ok=True)
+
     return StreamingResponse(
         generate(),
         media_type="text/event-stream",
@@ -282,6 +332,37 @@ async def upload_stream(request: Request):
             "X-Accel-Buffering": "no",
         },
     )
+
+
+@router.get("/list/{session_id}", summary="List documents uploaded to a session")
+async def list_session_documents(session_id: str):
+    normalized = normalize_session_id(session_id)
+    if not normalized or not session_store.session_exists(normalized):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found.")
+    documents = session_store.list_documents(normalized)
+    return {"session_id": normalized, "count": len(documents), "files": documents}
+
+
+@router.delete("/{session_id}/{file_id}", summary="Delete a document from a session")
+async def delete_session_document(session_id: str, file_id: str):
+    normalized = normalize_session_id(session_id)
+    if not normalized or not session_store.session_exists(normalized):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Session not found.")
+
+    deleted = session_store.delete_document(normalized, file_id)
+    if not deleted:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Document not found.")
+
+    try:
+        vs = get_vector_store()
+        vs.delete_document(file_id)
+    except Exception:
+        logger.warning(
+            "Unable to remove doc '%s' from Pinecone for session '%s'.",
+            file_id, normalized,
+        )
+
+    return {"message": f"'{file_id}' removed from session '{normalized}'."}
 
 
 @router.get("/list", summary="List all PDFs in Azure Blob Storage")

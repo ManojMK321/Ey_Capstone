@@ -36,5 +36,10 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=8000,
         reload=True,
+        # Uploads write to temp_uploads/ and the session store writes to
+        # sessions.db mid-request; without these excludes the reload watcher
+        # treats its own runtime writes as a source change and restarts the
+        # worker, silently killing whatever request was in flight.
+        reload_excludes=["temp_uploads/*", "sessions.db", "*.log"],
         log_level="info",
     )

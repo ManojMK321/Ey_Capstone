@@ -1,9 +1,22 @@
 import base64
 import json
+import re
+import sys
 import time
 import uuid
+from pathlib import Path
+
 import requests
 import streamlit as st
+
+# ── eval module path setup (GPT-4o-mini-judged RAGAS scoring) ───────────────────
+_ROOT     = Path(__file__).parents[1]
+_EVAL_DIR = _ROOT / "eval"
+for _p in (str(_EVAL_DIR), str(_ROOT)):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+from ragas_judge import score_turn  # noqa: E402
 
 # ── Page config ────────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -15,6 +28,7 @@ st.set_page_config(
 
 API           = "http://localhost:8000"
 EMBEDDING_DIM = 1536
+PAGE_RE       = re.compile(r"\(page\s+(\d+)\)", re.IGNORECASE)
 
 PIPELINE_STEPS = [
     "Parsing document layout",
@@ -400,6 +414,30 @@ hr { border-color:#2e2e2e !important; margin:12px 0 !important; }
   gap:0 !important;
 }
 
+/* ── evaluate button (RAGAS · GPT-4o mini) ── */
+.eval-btn .stButton > button {
+  background:transparent !important;
+  border:0.5px solid rgba(38,198,218,.35) !important;
+  color:#26C6DA !important; border-radius:6px !important;
+  font-size:11px !important; padding:4px 10px !important;
+  font-weight:400 !important; min-height:0 !important; height:auto !important;
+  width:auto !important; margin-top:6px !important;
+}
+.eval-btn .stButton > button:hover {
+  background:rgba(38,198,218,.08) !important; border-color:#26C6DA !important;
+}
+
+/* ── RAGAS metric cards ── */
+.ragas-card {
+  background:#171717; border:0.5px solid #262626; border-radius:10px;
+  padding:10px 14px; text-align:center; flex:1; min-width:0;
+}
+.ragas-chunk {
+  background:#161616; border:0.5px solid #232323; border-radius:8px;
+  padding:8px 12px; margin-bottom:6px; font-size:12px; color:#ccc;
+  line-height:1.5; word-break:break-word;
+}
+
 /* ── animations ── */
 @keyframes pipePulse {
   0%, 100% { opacity:1; transform:scale(1.15); }
@@ -550,6 +588,96 @@ def _thinking_html():
         f'<div style="margin-top:10px;display:flex;align-items:center;gap:5px;">'
         f'{dots}<span style="font-size:10px;color:#444;">Thinking…</span>'
         f'</div></div>'
+    )
+
+
+def _pages_from_source(source: str) -> list[int]:
+    return [int(m) for m in PAGE_RE.findall(source or "")]
+
+
+def _ragas_color(value):
+    if value is None:
+        return "#666666"
+    return "#4CAF50" if value >= 0.8 else ("#FF9800" if value >= 0.5 else "#F44336")
+
+
+def _latency_color(seconds):
+    if seconds is None:
+        return "#666666"
+    return "#4CAF50" if seconds < 5 else ("#FF9800" if seconds < 15 else "#F44336")
+
+
+def _metric_card_html(label: str, display: str, color: str) -> str:
+    return (
+        f'<div class="ragas-card"><div style="font-size:20px;font-weight:600;color:{color};">'
+        f'{display}</div><div style="font-size:10px;color:#888;text-transform:uppercase;'
+        f'letter-spacing:.05em;margin-top:3px;">{label}</div></div>'
+    )
+
+
+def _pipeline_metrics_html(msg: dict) -> str:
+    confidence    = msg.get("intent_confidence", 0.0)
+    latency_s     = msg.get("llm_latency_ms", 0.0) / 1000
+    input_tokens  = msg.get("input_tokens", 0)
+    output_tokens = msg.get("output_tokens", 0)
+
+    cards = "".join([
+        _metric_card_html("Intent Confidence", f"{confidence:.0%}", _ragas_color(confidence)),
+        _metric_card_html("LLM Latency", f"{latency_s:.2f}s", _latency_color(latency_s)),
+        _metric_card_html("Input Tokens", f"{input_tokens:,}", "#F5C518"),
+        _metric_card_html("Output Tokens", f"{output_tokens:,}", "#F5C518"),
+    ])
+    return (
+        '<div style="font-size:10px;color:#888;font-weight:600;text-transform:uppercase;'
+        'letter-spacing:.06em;margin:8px 0 6px;">Pipeline metrics</div>'
+        f'<div style="display:flex;gap:10px;margin-bottom:4px;">{cards}</div>'
+    )
+
+
+def _ragas_metrics_html(score) -> str:
+    metrics = [
+        ("Faithfulness", score.faithfulness),
+        ("Answer Relevancy", score.answer_relevancy),
+        ("Context Precision", score.context_precision),
+        ("Context Recall", score.context_recall),
+    ]
+    cards = "".join(
+        f'<div class="ragas-card">'
+        f'<div style="font-size:20px;font-weight:600;color:{_ragas_color(v)};">'
+        f'{f"{v:.2f}" if v is not None else "—"}</div>'
+        f'<div style="font-size:10px;color:#888;text-transform:uppercase;'
+        f'letter-spacing:.05em;margin-top:3px;">{label}</div></div>'
+        for label, v in metrics
+    )
+    return (
+        f'<div style="font-size:10px;color:#26C6DA;font-weight:600;text-transform:uppercase;'
+        f'letter-spacing:.06em;margin:10px 0 6px;">RAGAS · judged by GPT-4o mini</div>'
+        f'<div style="display:flex;gap:10px;margin-bottom:10px;">{cards}</div>'
+    )
+
+
+def _ragas_chunks_html(chunks: list) -> str:
+    if not chunks:
+        return '<div style="color:#666;font-size:12px;">No chunks were retrieved for this answer.</div>'
+    rows = ""
+    for i, c in enumerate(chunks, 1):
+        source  = c.get("source", "document")
+        content = (c.get("content") or "").strip()
+        pages   = _pages_from_source(source)
+        page_badges = "".join(
+            f'<span style="background:rgba(245,197,24,.12);color:#F5C518;'
+            f'border-radius:4px;padding:1px 7px;font-size:10px;margin-left:6px;">'
+            f'page {p}</span>' for p in pages
+        )
+        preview = content[:500] + ("…" if len(content) > 500 else "")
+        rows += (
+            f'<div class="ragas-chunk"><div style="color:#888;font-size:10px;'
+            f'margin-bottom:4px;">#{i} · {source}{page_badges}</div>{preview}</div>'
+        )
+    return (
+        '<div style="font-size:10px;color:#888;font-weight:600;text-transform:uppercase;'
+        'letter-spacing:.06em;margin:2px 0 6px;">Retrieved chunks &amp; PDF pages</div>'
+        f'{rows}'
     )
 
 
@@ -947,7 +1075,7 @@ elif st.session_state.screen == "chat":
 </div>""", unsafe_allow_html=True)
 
     # ── Message history ────────────────────────────────────────────────────
-    for msg in messages:
+    for msg_idx, msg in enumerate(messages):
         if msg.get("is_error"):
             st.error(msg["content"])
             continue
@@ -960,6 +1088,35 @@ elif st.session_state.screen == "chat":
                     for s in list(dict.fromkeys(srcs))[:4]
                 )
                 st.markdown(f'<div style="margin-top:8px;">{chips}</div>', unsafe_allow_html=True)
+
+            if msg["role"] == "assistant":
+                st.markdown(_pipeline_metrics_html(msg), unsafe_allow_html=True)
+
+                st.markdown('<div class="eval-btn">', unsafe_allow_html=True)
+                if st.button(
+                    "📊 Evaluate (RAGAS · GPT-4o mini)",
+                    key=f"eval_{active_key}_{msg_idx}",
+                ):
+                    question_text = messages[msg_idx - 1]["content"]
+                    contexts = [
+                        c.get("content", "") for c in msg.get("chunks", []) if c.get("content")
+                    ]
+                    with st.spinner("Judging with GPT-4o mini…"):
+                        try:
+                            msg["ragas_score"] = score_turn(question_text, msg["content"], contexts)
+                            msg["ragas_error"] = None
+                        except Exception as exc:
+                            msg["ragas_score"] = None
+                            msg["ragas_error"] = str(exc)
+                    st.rerun()
+                st.markdown('</div>', unsafe_allow_html=True)
+
+                if msg.get("ragas_error"):
+                    st.error(f"RAGAS evaluation failed: {msg['ragas_error']}")
+
+                if msg.get("ragas_score"):
+                    st.markdown(_ragas_metrics_html(msg["ragas_score"]), unsafe_allow_html=True)
+                    st.markdown(_ragas_chunks_html(msg.get("chunks", [])), unsafe_allow_html=True)
 
     # ── Chat input ─────────────────────────────────────────────────────────
     if prompt := st.chat_input("Ask a question about your contracts…"):
@@ -992,7 +1149,16 @@ elif st.session_state.screen == "chat":
                         )
                         st.markdown(f'<div style="margin-top:8px;">{chips}</div>', unsafe_allow_html=True)
                     session["messages"].append(
-                        {"role": "assistant", "content": answer, "sources": srcs}
+                        {
+                            "role":              "assistant",
+                            "content":           answer,
+                            "sources":           srcs,
+                            "chunks":            data.get("chunks", []),
+                            "intent_confidence": data.get("intent_confidence", 0.0),
+                            "llm_latency_ms":    data.get("llm_latency_ms", 0.0),
+                            "input_tokens":      data.get("input_tokens", 0),
+                            "output_tokens":     data.get("output_tokens", 0),
+                        }
                     )
                 else:
                     try:

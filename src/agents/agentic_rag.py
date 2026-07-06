@@ -6,45 +6,31 @@ from enum import Enum
 from openai import OpenAI
 from pydantic import BaseModel, ValidationError
 
-from docs.vector_store import FAISSVectorStore
+from src.observability.langsmith import traceable_operation
 
 logger = logging.getLogger(__name__)
 
 
 def _extract_response_text(response) -> str:
-    # Responses API: output_text shortcut
-    val = getattr(response, "output_text", None)
-    if val:
-        return val
-
-    # Responses API: traverse output items
-    for item in getattr(response, "output", None) or []:
-        if getattr(item, "type", None) == "message":
-            for c in getattr(item, "content", None) or []:
-                # type may be "output_text" or "text" depending on SDK version
-                if getattr(c, "type", None) in ("output_text", "text"):
-                    text = getattr(c, "text", None)
-                    if text:
-                        return text
-
-    # Chat Completions API fallback
-    try:
-        text = response.choices[0].message.content
-        if text:
-            return text
-    except Exception:
-        pass
-
+    if getattr(response, "output_text", None):
+        return response.output_text
+    if getattr(response, "output", None):
+        for item in response.output:
+            if getattr(item, "type", None) == "message":
+                for content_item in getattr(item, "content", []) or []:
+                    if getattr(content_item, "type", None) == "output_text":
+                        return getattr(content_item, "text", "")
     return ""
 
 
-def _clean_json(text: str) -> str:
-    """Strip markdown code fences that models sometimes wrap JSON in."""
-    text = text.strip()
-    # Remove ```json ... ``` or ``` ... ```
-    text = re.sub(r"^```(?:json)?\s*", "", text)
-    text = re.sub(r"\s*```$", "", text)
-    return text.strip()
+def _extract_usage(response) -> dict:
+    usage = getattr(response, "usage", None)
+    if usage is None:
+        return {"input_tokens": 0, "output_tokens": 0}
+    return {
+        "input_tokens":  getattr(usage, "input_tokens", 0) or 0,
+        "output_tokens": getattr(usage, "output_tokens", 0) or 0,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -80,15 +66,21 @@ class ValidationResult(BaseModel):
 
 class AgenticRAG:
 
-    def __init__(self, client: OpenAI, vector_store: FAISSVectorStore, top_k: int = 5, model: str = "gpt-4o"):
+    def __init__(self, client: OpenAI, vector_store, top_k: int = 5, model: str = "gpt-4o"):
         self.client = client
         self.vector_store = vector_store
         self.top_k = top_k
         self.model = model
+        self._usage_log: list[dict] = []
 
     # ------------------------------------------------------------------
     # 1. Query Analysis + Decompose
     # ------------------------------------------------------------------
+    @traceable_operation(
+        name="AgenticRAG query analysis",
+        tags=["agentic_rag", "llm"],
+        metadata={"component": "agentic_rag"},
+    )
     def analyze_query(self, question: str) -> list[str]:
         prompt = (
             "You are a query analysis agent. Decompose the following user question into up to three "
@@ -106,6 +98,7 @@ class AgenticRAG:
             temperature=0.0,
             max_output_tokens=200,
         )
+        self._usage_log.append(_extract_usage(response))
         output_text = _extract_response_text(response)
         lines = [line.strip("- ").strip() for line in output_text.splitlines() if line.strip()]
         return lines or [question]
@@ -123,17 +116,42 @@ class AgenticRAG:
     @staticmethod
     def _build_sources(retrieved: list[dict]) -> list[dict]:
         sources = []
+        # Each subquestion retrieves independently, so the same passage often
+        # comes back more than once across subquestions. Duplicate content
+        # adds no new information to the LLM's context, so it's paid for once.
+        seen_content: set[str] = set()
         for item in retrieved:
-            for doc in item["docs"]:
-                metadata = doc.metadata or {}
-                source_name = metadata.get("filename") or metadata.get("source") or "document"
-                page_number = metadata.get("page")
-                if page_number is not None:
-                    source_name = f"{source_name} (page {page_number})"
+            if isinstance(item, dict) and "docs" in item:
+                docs = item["docs"]
+                subquestion = item.get("subquestion", "")
+            else:
+                docs = [item]
+                subquestion = ""
+
+            for doc in docs:
+                if isinstance(doc, dict):
+                    metadata = doc.get("metadata") or {}
+                    source_name = metadata.get("filename") or metadata.get("source") or "document"
+                    page_number = metadata.get("page")
+                    if page_number is not None:
+                        source_name = f"{source_name} (page {page_number})"
+                    content = str(doc.get("content") or "").strip()
+                else:
+                    metadata = getattr(doc, "metadata", None) or {}
+                    source_name = metadata.get("filename") or metadata.get("source") or "document"
+                    page_number = metadata.get("page")
+                    if page_number is not None:
+                        source_name = f"{source_name} (page {page_number})"
+                    content = getattr(doc, "page_content", "").strip()
+
+                if content and content in seen_content:
+                    continue
+                seen_content.add(content)
+
                 sources.append({
-                    "subquestion": item["subquestion"],
+                    "subquestion": subquestion,
                     "source": source_name,
-                    "content": doc.page_content.strip(),
+                    "content": content,
                 })
         return sources
 
@@ -149,6 +167,11 @@ class AgenticRAG:
     # ------------------------------------------------------------------
     # 3. Task Router
     # ------------------------------------------------------------------
+    @traceable_operation(
+        name="AgenticRAG task routing",
+        tags=["agentic_rag", "routing"],
+        metadata={"component": "agentic_rag"},
+    )
     def route_task(self, question: str) -> TaskRouteResult:
         system_prompt = """
 You are the Task Router for a contract intelligence agentic RAG system.
@@ -171,18 +194,30 @@ Return ONLY valid JSON in this exact shape:
             temperature=0.0,
             max_output_tokens=150,
         )
-        text = _clean_json(_extract_response_text(response))
+        self._usage_log.append(_extract_usage(response))
+        text = _extract_response_text(response).strip()
+        if not text:
+            logger.warning("Task routing returned empty text, defaulting to general.")
+            return TaskRouteResult(task=TaskType.GENERAL, reason="Fallback due to empty router output")
+
+        match = re.search(r"\{.*\}", text, re.DOTALL)
+        json_text = match.group(0) if match else text
+
         try:
-            if not text:
-                raise ValueError("Empty response from model")
-            return TaskRouteResult.model_validate(json.loads(text))
-        except (ValidationError, json.JSONDecodeError, ValueError) as e:
-            logger.warning("Task routing failed, defaulting to general: %s", e)
+            payload = json.loads(json_text)
+            return TaskRouteResult.model_validate(payload)
+        except Exception as e:
+            logger.exception("Task routing failed, defaulting to general: %s", e)
             return TaskRouteResult(task=TaskType.GENERAL, reason="Fallback due to parsing failure")
 
     # ------------------------------------------------------------------
     # 4. Specialist agents — Comparison / Compliance / General
     # ------------------------------------------------------------------
+    @traceable_operation(
+        name="AgenticRAG comparison agent",
+        tags=["agentic_rag", "llm", "comparison"],
+        metadata={"component": "agentic_rag"},
+    )
     def _run_comparison_agent(self, question: str, context: str, history_section: str) -> str:
         prompt = (
             "You are the Comparison Agent for a contract intelligence system. Using only the provided "
@@ -201,8 +236,14 @@ Return ONLY valid JSON in this exact shape:
             temperature=0.2,
             max_output_tokens=600,
         )
+        self._usage_log.append(_extract_usage(response))
         return _extract_response_text(response).strip()
 
+    @traceable_operation(
+        name="AgenticRAG compliance agent",
+        tags=["agentic_rag", "llm", "compliance"],
+        metadata={"component": "agentic_rag"},
+    )
     def _run_compliance_agent(self, question: str, context: str, history_section: str) -> str:
         prompt = (
             "You are the Compliance Agent for a contract intelligence system. Using only the provided "
@@ -221,8 +262,14 @@ Return ONLY valid JSON in this exact shape:
             temperature=0.2,
             max_output_tokens=600,
         )
+        self._usage_log.append(_extract_usage(response))
         return _extract_response_text(response).strip()
 
+    @traceable_operation(
+        name="AgenticRAG general agent",
+        tags=["agentic_rag", "llm", "general"],
+        metadata={"component": "agentic_rag"},
+    )
     def _run_general_agent(self, question: str, context: str, history_section: str) -> str:
         prompt = (
             "You are an expert contract reasoning assistant. Use the provided passages to answer the "
@@ -240,8 +287,14 @@ Return ONLY valid JSON in this exact shape:
             temperature=0.2,
             max_output_tokens=600,
         )
+        self._usage_log.append(_extract_usage(response))
         return _extract_response_text(response).strip()
 
+    @traceable_operation(
+        name="AgenticRAG specialist agent",
+        tags=["agentic_rag", "llm"],
+        metadata={"component": "agentic_rag"},
+    )
     def run_specialist_agent(self, task: TaskType, question: str, context: str, history_section: str) -> str:
         if task == TaskType.COMPARISON:
             return self._run_comparison_agent(question, context, history_section)
@@ -252,6 +305,11 @@ Return ONLY valid JSON in this exact shape:
     # ------------------------------------------------------------------
     # 5. Validation
     # ------------------------------------------------------------------
+    @traceable_operation(
+        name="AgenticRAG validation",
+        tags=["agentic_rag", "llm", "validation"],
+        metadata={"component": "agentic_rag"},
+    )
     def validate(self, draft_answer: str, context: str) -> ValidationResult:
         system_prompt = """
 You are the Validation Agent. Check the draft answer strictly against the provided context.
@@ -271,18 +329,22 @@ Return ONLY valid JSON in this exact shape:
             temperature=0.0,
             max_output_tokens=700,
         )
-        text = _clean_json(_extract_response_text(response))
+        self._usage_log.append(_extract_usage(response))
+        text = _extract_response_text(response).strip()
         try:
-            if not text:
-                raise ValueError("Empty response from model")
             return ValidationResult.model_validate(json.loads(text))
-        except (ValidationError, json.JSONDecodeError, ValueError) as e:
-            logger.warning("Validation failed, passing draft through unmodified: %s", e)
+        except (ValidationError, json.JSONDecodeError) as e:
+            logger.exception("Validation failed, passing draft through unmodified: %s", e)
             return ValidationResult(is_grounded=True, issues=[], corrected_answer=draft_answer)
 
     # ------------------------------------------------------------------
     # 6. Response (final polish)
     # ------------------------------------------------------------------
+    @traceable_operation(
+        name="AgenticRAG final response generation",
+        tags=["agentic_rag", "llm", "response_generation"],
+        metadata={"component": "agentic_rag"},
+    )
     def generate_response(self, question: str, validated_answer: str) -> str:
         prompt = (
             "Take the validated answer below and present it clearly and concisely to the user, in a tone "
@@ -298,12 +360,14 @@ Return ONLY valid JSON in this exact shape:
             temperature=0.3,
             max_output_tokens=600,
         )
+        self._usage_log.append(_extract_usage(response))
         return _extract_response_text(response).strip()
 
     # ------------------------------------------------------------------
     # Orchestration entry point
     # ------------------------------------------------------------------
     def run(self, question: str, history: str | None = None) -> dict:
+        self._usage_log = []
         history_section = f"Previous conversation:\n{history}\n\n" if history else ""
 
         subquestions = self.analyze_query(question)
@@ -331,4 +395,6 @@ Return ONLY valid JSON in this exact shape:
             "subquestions":      subquestions,
             "retrieved":         retrieved,
             "sources":           sources,
+            "input_tokens":      sum(u["input_tokens"] for u in self._usage_log),
+            "output_tokens":     sum(u["output_tokens"] for u in self._usage_log),
         }

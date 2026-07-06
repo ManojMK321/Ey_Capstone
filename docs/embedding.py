@@ -41,7 +41,15 @@ class OpenAIEmbedder:
         if not api_key:
             raise ValueError("OPENAI_API_KEY not set in environment.")
 
-        kwargs: dict = {"model": self.config.model, "api_key": api_key}
+        kwargs: dict = {
+            "model": self.config.model,
+            "api_key": api_key,
+            # Upload embedding calls have been hitting transient DNS/connection
+            # errors in production; the SDK's default of 2 retries gives up
+            # too quickly on a blip that clears within a few seconds.
+            "max_retries": 5,
+            "timeout": 30,
+        }
         if self.config.dimensions:
             kwargs["dimensions"] = self.config.dimensions
 

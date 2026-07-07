@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 import uuid
 from typing import Optional
 
@@ -27,6 +28,8 @@ from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
 from langchain_pinecone import PineconeVectorStore
 from pinecone import Pinecone, ServerlessSpec
+
+from src.observability import metrics
 
 logger = logging.getLogger(__name__)
 
@@ -113,10 +116,14 @@ class PineconeVectorStoreManager:
         ids = self._make_vector_ids(documents)
         logger.info("Upserting %d chunks to Pinecone.", len(documents))
 
+        start = time.perf_counter()
         self.vector_store.add_documents(
             documents=documents,
             ids=ids,
             namespace=self.namespace,
+        )
+        metrics.record_vector_query(
+            store_type="pinecone", operation="index", duration=time.perf_counter() - start,
         )
 
         logger.info("Upsert complete.")
@@ -128,12 +135,18 @@ class PineconeVectorStoreManager:
         doc_id: Optional[str] = None,
     ) -> list[Document]:
         search_filter = {"doc_id": {"$eq": doc_id}} if doc_id else None
-        return self.vector_store.similarity_search(
+        start = time.perf_counter()
+        docs = self.vector_store.similarity_search(
             query=query,
             k=k,
             filter=search_filter,
             namespace=self.namespace,
         )
+        metrics.record_vector_query(
+            store_type="pinecone", operation="query",
+            duration=time.perf_counter() - start, num_results=len(docs),
+        )
+        return docs
 
     def similarity_search_with_score(
         self,
@@ -142,12 +155,18 @@ class PineconeVectorStoreManager:
         doc_id: Optional[str] = None,
     ) -> list[tuple[Document, float]]:
         search_filter = {"doc_id": {"$eq": doc_id}} if doc_id else None
-        return self.vector_store.similarity_search_with_score(
+        start = time.perf_counter()
+        results = self.vector_store.similarity_search_with_score(
             query=query,
             k=k,
             filter=search_filter,
             namespace=self.namespace,
         )
+        metrics.record_vector_query(
+            store_type="pinecone", operation="query",
+            duration=time.perf_counter() - start, num_results=len(results),
+        )
+        return results
 
     def document_count(self) -> int:
         stats = self._index.describe_index_stats()

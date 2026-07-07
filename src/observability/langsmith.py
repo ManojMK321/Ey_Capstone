@@ -85,3 +85,37 @@ def is_enabled() -> bool:
     if ls is None:
         return False
     return os.getenv("LANGSMITH_TRACING", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+class LangSmithRequestTracingMiddleware:
+    """
+    ASGI middleware — wraps every HTTP request in a LangSmith tracing_context
+    so nested `@traceable_operation` calls (chat, upload, agent steps, ...)
+    share one project scope and get tagged with the route that triggered
+    them. No-op pass-through when LangSmith isn't configured.
+
+        app.add_middleware(LangSmithRequestTracingMiddleware)
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http" or not is_enabled():
+            await self.app(scope, receive, send)
+            return
+
+        client = _get_client()
+        if client is None:
+            await self.app(scope, receive, send)
+            return
+
+        method = scope.get("method", "")
+        path = scope.get("path", "")
+        with tracing_context(
+            client=client,
+            enabled=True,
+            project_name=_get_project_name(),
+            tags=[method, path],
+        ):
+            await self.app(scope, receive, send)

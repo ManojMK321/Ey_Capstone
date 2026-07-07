@@ -7,6 +7,7 @@ from openai import OpenAI
 from pydantic import BaseModel, ValidationError
 
 from src.observability.langsmith import traceable_operation
+from src.observability import metrics
 
 logger = logging.getLogger(__name__)
 
@@ -89,15 +90,16 @@ class AgenticRAG:
             f"Question: {question}\n"
             "Subquestions:"
         )
-        response = self.client.responses.create(
-            model=self.model,
-            input=[
-                {"role": "system", "content": "Decompose a user query into subquestions for retrieval."},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.0,
-            max_output_tokens=200,
-        )
+        with metrics.timed_llm_call(self.model, operation="analyze_query"):
+            response = self.client.responses.create(
+                model=self.model,
+                input=[
+                    {"role": "system", "content": "Decompose a user query into subquestions for retrieval."},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.0,
+                max_output_tokens=200,
+            )
         self._usage_log.append(_extract_usage(response))
         output_text = _extract_response_text(response)
         lines = [line.strip("- ").strip() for line in output_text.splitlines() if line.strip()]
@@ -107,11 +109,12 @@ class AgenticRAG:
     # 2. Retrieve
     # ------------------------------------------------------------------
     def retrieve(self, subquestions: list[str]) -> list[dict]:
-        retrieved = []
-        for sub in subquestions:
-            docs = self.vector_store.similarity_search(query=sub, k=self.top_k)
-            retrieved.append({"subquestion": sub, "docs": docs})
-        return retrieved
+        with metrics.timed_agent_step("agentic_rag", "retrieve"):
+            retrieved = []
+            for sub in subquestions:
+                docs = self.vector_store.similarity_search(query=sub, k=self.top_k)
+                retrieved.append({"subquestion": sub, "docs": docs})
+            return retrieved
 
     @staticmethod
     def _build_sources(retrieved: list[dict]) -> list[dict]:
@@ -185,15 +188,16 @@ Decide which specialist agent should handle the question. Choose exactly one:
 Return ONLY valid JSON in this exact shape:
 {"task": "comparison", "reason": "short justification"}
 """
-        response = self.client.responses.create(
-            model=self.model,
-            input=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": question},
-            ],
-            temperature=0.0,
-            max_output_tokens=150,
-        )
+        with metrics.timed_llm_call(self.model, operation="route_task"):
+            response = self.client.responses.create(
+                model=self.model,
+                input=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": question},
+                ],
+                temperature=0.0,
+                max_output_tokens=150,
+            )
         self._usage_log.append(_extract_usage(response))
         text = _extract_response_text(response).strip()
         if not text:
@@ -227,15 +231,16 @@ Return ONLY valid JSON in this exact shape:
             f"{history_section}"
             f"{context}\n\nQuestion: {question}\nAnswer:"
         )
-        response = self.client.responses.create(
-            model=self.model,
-            input=[
-                {"role": "system", "content": "You are an expert contract comparison assistant."},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.2,
-            max_output_tokens=600,
-        )
+        with metrics.timed_llm_call(self.model, operation="comparison_agent"):
+            response = self.client.responses.create(
+                model=self.model,
+                input=[
+                    {"role": "system", "content": "You are an expert contract comparison assistant."},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.2,
+                max_output_tokens=600,
+            )
         self._usage_log.append(_extract_usage(response))
         return _extract_response_text(response).strip()
 
@@ -253,15 +258,16 @@ Return ONLY valid JSON in this exact shape:
             f"{history_section}"
             f"{context}\n\nQuestion: {question}\nAnswer:"
         )
-        response = self.client.responses.create(
-            model=self.model,
-            input=[
-                {"role": "system", "content": "You are an expert contract compliance and risk assistant."},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.2,
-            max_output_tokens=600,
-        )
+        with metrics.timed_llm_call(self.model, operation="compliance_agent"):
+            response = self.client.responses.create(
+                model=self.model,
+                input=[
+                    {"role": "system", "content": "You are an expert contract compliance and risk assistant."},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.2,
+                max_output_tokens=600,
+            )
         self._usage_log.append(_extract_usage(response))
         return _extract_response_text(response).strip()
 
@@ -278,15 +284,16 @@ Return ONLY valid JSON in this exact shape:
             f"{history_section}"
             f"{context}\n\nQuestion: {question}\nAnswer:"
         )
-        response = self.client.responses.create(
-            model=self.model,
-            input=[
-                {"role": "system", "content": "You are an expert assistant that synthesizes multiple documents and validates citations."},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.2,
-            max_output_tokens=600,
-        )
+        with metrics.timed_llm_call(self.model, operation="general_agent"):
+            response = self.client.responses.create(
+                model=self.model,
+                input=[
+                    {"role": "system", "content": "You are an expert assistant that synthesizes multiple documents and validates citations."},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.2,
+                max_output_tokens=600,
+            )
         self._usage_log.append(_extract_usage(response))
         return _extract_response_text(response).strip()
 
@@ -320,15 +327,16 @@ Return ONLY valid JSON in this exact shape:
 {"is_grounded": true, "issues": [], "corrected_answer": "..."}
 """
         user_prompt = f"Context:\n{context}\n\nDraft answer:\n{draft_answer}\n\nValidate this draft."
-        response = self.client.responses.create(
-            model=self.model,
-            input=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            temperature=0.0,
-            max_output_tokens=700,
-        )
+        with metrics.timed_llm_call(self.model, operation="validate"):
+            response = self.client.responses.create(
+                model=self.model,
+                input=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=0.0,
+                max_output_tokens=700,
+            )
         self._usage_log.append(_extract_usage(response))
         text = _extract_response_text(response).strip()
         try:
@@ -351,15 +359,16 @@ Return ONLY valid JSON in this exact shape:
             "appropriate to the original question. Do not add information beyond what's given.\n\n"
             f"Original question: {question}\n\nValidated answer:\n{validated_answer}\n\nFinal response:"
         )
-        response = self.client.responses.create(
-            model=self.model,
-            input=[
-                {"role": "system", "content": "You are the final Response Generator in a RAG pipeline."},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.3,
-            max_output_tokens=600,
-        )
+        with metrics.timed_llm_call(self.model, operation="generate_response"):
+            response = self.client.responses.create(
+                model=self.model,
+                input=[
+                    {"role": "system", "content": "You are the final Response Generator in a RAG pipeline."},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.3,
+                max_output_tokens=600,
+            )
         self._usage_log.append(_extract_usage(response))
         return _extract_response_text(response).strip()
 
@@ -367,34 +376,35 @@ Return ONLY valid JSON in this exact shape:
     # Orchestration entry point
     # ------------------------------------------------------------------
     def run(self, question: str, history: str | None = None) -> dict:
-        self._usage_log = []
-        history_section = f"Previous conversation:\n{history}\n\n" if history else ""
+        with metrics.timed_agent_step("agentic_rag", "run"):
+            self._usage_log = []
+            history_section = f"Previous conversation:\n{history}\n\n" if history else ""
 
-        subquestions = self.analyze_query(question)
-        retrieved    = self.retrieve(subquestions)
-        sources      = self._build_sources(retrieved)
-        context      = self._build_context(sources)
+            subquestions = self.analyze_query(question)
+            retrieved    = self.retrieve(subquestions)
+            sources      = self._build_sources(retrieved)
+            context      = self._build_context(sources)
 
-        route = self.route_task(question)
-        logger.info("Task routed: %s — %s", route.task.value, route.reason)
+            route = self.route_task(question)
+            logger.info("Task routed: %s — %s", route.task.value, route.reason)
 
-        draft_answer = self.run_specialist_agent(route.task, question, context, history_section)
+            draft_answer = self.run_specialist_agent(route.task, question, context, history_section)
 
-        validation = self.validate(draft_answer, context)
-        logger.info("Validation: grounded=%s issues=%s", validation.is_grounded, validation.issues)
+            validation = self.validate(draft_answer, context)
+            logger.info("Validation: grounded=%s issues=%s", validation.is_grounded, validation.issues)
 
-        final_answer = self.generate_response(question, validation.corrected_answer)
+            final_answer = self.generate_response(question, validation.corrected_answer)
 
-        return {
-            "answer":            final_answer,
-            "task":              route.task.value,
-            "task_reason":       route.reason,
-            "draft_answer":      draft_answer,
-            "is_grounded":       validation.is_grounded,
-            "validation_issues": validation.issues,
-            "subquestions":      subquestions,
-            "retrieved":         retrieved,
-            "sources":           sources,
-            "input_tokens":      sum(u["input_tokens"] for u in self._usage_log),
-            "output_tokens":     sum(u["output_tokens"] for u in self._usage_log),
-        }
+            return {
+                "answer":            final_answer,
+                "task":              route.task.value,
+                "task_reason":       route.reason,
+                "draft_answer":      draft_answer,
+                "is_grounded":       validation.is_grounded,
+                "validation_issues": validation.issues,
+                "subquestions":      subquestions,
+                "retrieved":         retrieved,
+                "sources":           sources,
+                "input_tokens":      sum(u["input_tokens"] for u in self._usage_log),
+                "output_tokens":     sum(u["output_tokens"] for u in self._usage_log),
+            }

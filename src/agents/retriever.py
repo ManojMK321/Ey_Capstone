@@ -13,12 +13,15 @@ Dependencies:
 from __future__ import annotations
 
 import logging
+import time
 from typing import Optional
 
 from langchain_community.retrievers import BM25Retriever
 from langchain.retrievers.ensemble import EnsembleRetriever
 from langchain_core.documents import Document
 from sentence_transformers import CrossEncoder
+
+from src.observability import metrics
 
 logger = logging.getLogger(__name__)
 
@@ -96,9 +99,11 @@ def rerank(
     if not docs:
         return []
 
+    start = time.perf_counter()
     cross_encoder = _get_cross_encoder()
     pairs  = [(query, doc.page_content) for doc in docs]
     scores = cross_encoder.predict(pairs)
+    metrics.RETRIEVAL_RANK_BM25_DURATION_SECONDS.observe(time.perf_counter() - start)
 
     ranked = sorted(zip(docs, scores), key=lambda x: x[1], reverse=True)
     top    = [doc for doc, _ in ranked[:top_n]]

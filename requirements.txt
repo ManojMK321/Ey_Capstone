@@ -50,6 +50,12 @@ datasets>=2.14.0
 python-dotenv>=1.0.0
 langsmith>=0.9.0
 
+# ── Observability (Prometheus metrics + OpenTelemetry tracing) ───────────────
+prometheus-client>=0.20.0
+prometheus-fastapi-instrumentator>=7.0.0
+opentelemetry-sdk>=1.24.0
+opentelemetry-exporter-otlp-proto-grpc>=1.24.0   # optional — only needed if OTEL_EXPORTER_OTLP_ENDPOINT is set
+
 # ── Jupyter ───────────────────────────────────────────────────────────────────
 jupyter>=1.0.0
 nbformat>=5.9.0

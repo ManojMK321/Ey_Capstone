@@ -1,6 +1,7 @@
 import asyncio
 import json
 import tempfile
+import time
 import uuid
 import logging
 from pathlib import Path
@@ -14,6 +15,7 @@ from src.retrieval.blob_storage import upload_blob, list_blobs, delete_blob, blo
 from src.retrieval.doc_registry import register_document
 from src.orchestrator.session_store_postgres import session_store
 from src.observability.langsmith import traceable_operation
+from src.observability import metrics
 from docs.pipeline import get_pipeline, get_vector_store
 
 logger = logging.getLogger(__name__)
@@ -133,11 +135,14 @@ async def upload_documents(request: Request) -> UploadResponse:
 
     for file in files:
         temp_path: Path | None = None
+        file_type = (Path(file.filename).suffix.lstrip(".").lower() or "unknown") if file.filename else "unknown"
+        upload_start = time.perf_counter()
         try:
             # ── 1. Validate ───────────────────────────────────────────
             err = validate_file(file)
             if err:
                 errors.append({"filename": file.filename, "reason": err})
+                metrics.UPLOAD_ERRORS.labels(file_type=file_type, error_type="validation").inc()
                 continue
 
             # ── 2. Read into memory & save to local temp ──────────────
@@ -149,17 +154,23 @@ async def upload_documents(request: Request) -> UploadResponse:
             logger.info("Saved locally: %s (%d bytes)", temp_path, size)
 
             # ── 3. Parse PDF → pages ──────────────────────────────────
+            stage_start = time.perf_counter()
             pages = parser.parse(pdf_path=temp_path)
+            metrics.DOCUMENT_PROCESSING_DURATION_SECONDS.labels(file_type=file_type, stage="parse").observe(time.perf_counter() - stage_start)
             page_count = len(pages)
             logger.info("Parsed %d page(s) from '%s'.", page_count, file.filename)
 
             # ── 4. Chunk pages ────────────────────────────────────────
+            stage_start = time.perf_counter()
             chunks = chunker.chunk(pages=pages, doc_id=file_id, filename=file.filename)
+            metrics.DOCUMENT_PROCESSING_DURATION_SECONDS.labels(file_type=file_type, stage="chunk").observe(time.perf_counter() - stage_start)
             chunk_count = len(chunks)
             logger.info("Generated %d chunk(s) from '%s'.", chunk_count, file.filename)
 
             # ── 5. Embed & store in Pinecone ──────────────────────────
+            stage_start = time.perf_counter()
             vector_store.add_documents(chunks)
+            metrics.DOCUMENT_PROCESSING_DURATION_SECONDS.labels(file_type=file_type, stage="embed_store").observe(time.perf_counter() - stage_start)
             logger.info("Stored %d chunks in Pinecone for doc_id '%s'.", chunk_count, file_id)
 
             # ── 6. Upload to Azure Blob Storage (optional) ────────────
@@ -193,14 +204,21 @@ async def upload_documents(request: Request) -> UploadResponse:
                 page_count=page_count,
                 chunk_count=chunk_count,
             )
+            metrics.record_document_upload(
+                file_type=file_type,
+                total_duration=time.perf_counter() - upload_start,
+                num_chunks=chunk_count,
+            )
 
         except ValueError as ve:
             logger.warning(str(ve))
             errors.append({"filename": file.filename, "reason": str(ve)})
+            metrics.UPLOAD_ERRORS.labels(file_type=file_type, error_type="value_error").inc()
 
         except Exception as ex:
             logger.error("Unexpected error for '%s': %s", file.filename, ex, exc_info=True)
             errors.append({"filename": file.filename, "reason": "An unexpected error occurred."})
+            metrics.UPLOAD_ERRORS.labels(file_type=file_type, error_type=type(ex).__name__).inc()
 
         finally:
             if temp_path and temp_path.exists():
@@ -241,10 +259,13 @@ async def upload_stream(request: Request):
 
     async def generate():
         temp_path: Path | None = None
+        file_type = (Path(file.filename).suffix.lstrip(".").lower() or "unknown") if file.filename else "unknown"
+        upload_start = time.perf_counter()
         try:
             # ── validate ──────────────────────────────────────────────
             err = validate_file(file)
             if err:
+                metrics.UPLOAD_ERRORS.labels(file_type=file_type, error_type="validation").inc()
                 yield f"data: {json.dumps({'error': err})}\n\n"
                 return
 
@@ -260,7 +281,9 @@ async def upload_stream(request: Request):
             # ── step 0 – parse ────────────────────────────────────────
             yield f"data: {json.dumps({'step': 0, 'status': 'running'})}\n\n"
             await asyncio.sleep(0)
+            stage_start = time.perf_counter()
             pages      = parser.parse(pdf_path=temp_path)
+            metrics.DOCUMENT_PROCESSING_DURATION_SECONDS.labels(file_type=file_type, stage="parse").observe(time.perf_counter() - stage_start)
             page_count = len(pages)
             logger.info("Parsed %d page(s) from '%s'.", page_count, file.filename)
             yield f"data: {json.dumps({'step': 0, 'status': 'done', 'pages': page_count})}\n\n"
@@ -269,7 +292,9 @@ async def upload_stream(request: Request):
             # ── step 1 – clean (runs inside chunker) ──────────────────
             yield f"data: {json.dumps({'step': 1, 'status': 'running'})}\n\n"
             await asyncio.sleep(0)
+            stage_start = time.perf_counter()
             chunks      = chunker.chunk(pages=pages, doc_id=file_id, filename=file.filename)
+            metrics.DOCUMENT_PROCESSING_DURATION_SECONDS.labels(file_type=file_type, stage="chunk").observe(time.perf_counter() - stage_start)
             chunk_count = len(chunks)
             logger.info("Generated %d chunk(s) from '%s'.", chunk_count, file.filename)
             yield f"data: {json.dumps({'step': 1, 'status': 'done'})}\n\n"
@@ -282,7 +307,9 @@ async def upload_stream(request: Request):
             # ── step 3 – embed (calls OpenAI — slow) ─────────────────
             yield f"data: {json.dumps({'step': 3, 'status': 'running'})}\n\n"
             await asyncio.sleep(0)
+            stage_start = time.perf_counter()
             vector_store.add_documents(chunks)
+            metrics.DOCUMENT_PROCESSING_DURATION_SECONDS.labels(file_type=file_type, stage="embed_store").observe(time.perf_counter() - stage_start)
             logger.info("Stored %d chunks in Pinecone vector database for doc_id '%s'.", chunk_count, file_id)
             yield f"data: {json.dumps({'step': 3, 'status': 'done'})}\n\n"
             await asyncio.sleep(0)
@@ -306,6 +333,12 @@ async def upload_stream(request: Request):
                 chunk_count=chunk_count,
             )
 
+            metrics.record_document_upload(
+                file_type=file_type,
+                total_duration=time.perf_counter() - upload_start,
+                num_chunks=chunk_count,
+            )
+
             result = {
                 "file_id":       file_id,
                 "original_name": file.filename,
@@ -318,10 +351,12 @@ async def upload_stream(request: Request):
 
         except ValueError as ve:
             logger.warning(str(ve))
+            metrics.UPLOAD_ERRORS.labels(file_type=file_type, error_type="value_error").inc()
             yield f"data: {json.dumps({'error': str(ve)})}\n\n"
 
         except Exception as ex:
             logger.error("Stream upload error: %s", ex, exc_info=True)
+            metrics.UPLOAD_ERRORS.labels(file_type=file_type, error_type=type(ex).__name__).inc()
             yield f"data: {json.dumps({'error': 'An unexpected error occurred.'})}\n\n"
 
         finally:

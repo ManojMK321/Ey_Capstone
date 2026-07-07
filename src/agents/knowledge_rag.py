@@ -17,6 +17,7 @@ from langchain_core.documents import Document
 from openai import OpenAI
 
 from src.observability.langsmith import traceable_operation
+from src.observability import metrics
 
 logger = logging.getLogger(__name__)
 
@@ -158,32 +159,33 @@ class KnowledgeRAG:
         metadata={"component": "knowledge_rag"},
     )
     def retrieve(self, query: str) -> tuple[list[Document], str]:
-        if _HYBRID_AVAILABLE:
-            try:
-                retriever = build_hybrid_retriever(
-                    self.vector_store,
-                    k=self.k_initial,
-                    bm25_weight=self.bm25_weight,
-                    dense_weight=self.dense_weight,
-                )
-                candidates = retriever.invoke(query)
-                docs = _rerank(query, candidates, top_n=self.k_final)
-                logger.debug(
-                    "KnowledgeRAG: hybrid retrieval returned %d docs for query: %.80s",
-                    len(docs), query,
-                )
-                return docs, "hybrid"
-            except Exception as exc:
-                logger.warning(
-                    "KnowledgeRAG: hybrid retrieval failed (%s); falling back to dense.", exc
-                )
+        with metrics.timed_agent_step("knowledge_rag", "retrieve"):
+            if _HYBRID_AVAILABLE:
+                try:
+                    retriever = build_hybrid_retriever(
+                        self.vector_store,
+                        k=self.k_initial,
+                        bm25_weight=self.bm25_weight,
+                        dense_weight=self.dense_weight,
+                    )
+                    candidates = retriever.invoke(query)
+                    docs = _rerank(query, candidates, top_n=self.k_final)
+                    logger.debug(
+                        "KnowledgeRAG: hybrid retrieval returned %d docs for query: %.80s",
+                        len(docs), query,
+                    )
+                    return docs, "hybrid"
+                except Exception as exc:
+                    logger.warning(
+                        "KnowledgeRAG: hybrid retrieval failed (%s); falling back to dense.", exc
+                    )
 
-        docs = self.vector_store.similarity_search(query=query, k=self.k_final)
-        if not docs:
-            logger.info("KnowledgeRAG: no documents retrieved for query: %.80s", query)
-        else:
-            logger.debug("KnowledgeRAG: dense retrieval returned %d docs.", len(docs))
-        return docs, "dense"
+            docs = self.vector_store.similarity_search(query=query, k=self.k_final)
+            if not docs:
+                logger.info("KnowledgeRAG: no documents retrieved for query: %.80s", query)
+            else:
+                logger.debug("KnowledgeRAG: dense retrieval returned %d docs.", len(docs))
+            return docs, "dense"
 
     @traceable_operation(
         name="KnowledgeRAG answer",
@@ -207,15 +209,16 @@ class KnowledgeRAG:
         )
 
         try:
-            response = self.client.responses.create(
-                model=self.model,
-                input=[
-                    {"role": "system", "content": _SYSTEM_PROMPT},
-                    {"role": "user",   "content": user_prompt},
-                ],
-                temperature=self.temperature,
-                max_output_tokens=self.max_output_tokens,
-            )
+            with metrics.timed_llm_call(self.model, operation="answer"):
+                response = self.client.responses.create(
+                    model=self.model,
+                    input=[
+                        {"role": "system", "content": _SYSTEM_PROMPT},
+                        {"role": "user",   "content": user_prompt},
+                    ],
+                    temperature=self.temperature,
+                    max_output_tokens=self.max_output_tokens,
+                )
         except Exception as exc:
             logger.error("KnowledgeRAG: LLM call failed for query: %.80s — %s", query, exc)
             raise

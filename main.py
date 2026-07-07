@@ -2,6 +2,9 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from src.api.upload_api import router as upload_router
 from src.api.chat import router as chat_router
+from src.observability.telemetry import setup_observability
+from src.observability.langsmith import LangSmithRequestTracingMiddleware
+from src.observability import metrics
 from docs.pipeline import get_pipeline
 import uvicorn
 import logging
@@ -11,6 +14,8 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
 logger = logging.getLogger(__name__)
+
+setup_observability()
 
 app = FastAPI(
     title="Contract Intelligence Chatbot",
@@ -29,7 +34,11 @@ def _warm_up_ingestion_pipeline() -> None:
     # first, making that upload look stuck for up to a minute. Paying that
     # cost once at startup keeps every real upload fast.
     logger.info("Warming up ingestion pipeline...")
-    get_pipeline()
+    _, _, vector_store = get_pipeline()
+    metrics.SYSTEM_HEALTH_STATUS.labels(component="api").set(1)
+    metrics.SYSTEM_HEALTH_STATUS.labels(component="vector_store").set(
+        1 if getattr(vector_store, "vector_store", None) is not None else 0
+    )
     logger.info("Ingestion pipeline warm.")
 
 app.add_middleware(
@@ -39,6 +48,17 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(LangSmithRequestTracingMiddleware)
+
+try:
+    from prometheus_fastapi_instrumentator import Instrumentator
+    Instrumentator().instrument(app).expose(app, endpoint="/metrics", include_in_schema=False)
+    logger.info("Prometheus metrics exposed at /metrics")
+except ImportError:
+    logger.warning(
+        "prometheus-fastapi-instrumentator not installed; /metrics endpoint disabled. "
+        "Install with: pip install prometheus-fastapi-instrumentator"
+    )
 
 app.include_router(upload_router, prefix="/upload", tags=["Upload"])
 app.include_router(chat_router,   prefix="/chat",   tags=["Chat"])

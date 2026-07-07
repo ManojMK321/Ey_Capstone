@@ -20,6 +20,8 @@ import psycopg2.extras
 from psycopg2.pool import ThreadedConnectionPool
 from dotenv import load_dotenv
 
+from src.observability import metrics
+
 load_dotenv(dotenv_path=Path(__file__).parents[2] / ".env", override=True)
 
 logger = logging.getLogger(__name__)
@@ -159,44 +161,49 @@ class SessionStore:
         if not reset and session_id and self.session_exists(session_id):
             return session_id
         new_id = str(uuid.uuid4())
-        with _get_conn() as cur:
-            cur.execute(
-                "INSERT INTO sessions (session_id, created_at, last_active, turn_count) VALUES (%s, now(), now(), 0)",
-                (new_id,),
-            )
+        with metrics.timed_db_query("postgres", "make_session"):
+            with _get_conn() as cur:
+                cur.execute(
+                    "INSERT INTO sessions (session_id, created_at, last_active, turn_count) VALUES (%s, now(), now(), 0)",
+                    (new_id,),
+                )
+        metrics.ACTIVE_SESSIONS.inc()
         return new_id
 
     def session_exists(self, session_id: str) -> bool:
-        with _get_conn() as cur:
-            cur.execute("SELECT 1 FROM sessions WHERE session_id = %s", (session_id,))
-            return cur.fetchone() is not None
+        with metrics.timed_db_query("postgres", "session_exists"):
+            with _get_conn() as cur:
+                cur.execute("SELECT 1 FROM sessions WHERE session_id = %s", (session_id,))
+                return cur.fetchone() is not None
 
     def append_history(self, session_id: str, role: str, text: str) -> None:
-        with _get_conn() as cur:
-            cur.execute(
-                "INSERT INTO history (session_id, role, text, created_at) VALUES (%s, %s, %s, now())",
-                (session_id, role, text),
-            )
-            cur.execute(
-                "DELETE FROM history WHERE session_id = %s AND id NOT IN "
-                "(SELECT id FROM history WHERE session_id = %s ORDER BY id DESC LIMIT %s)",
-                (session_id, session_id, MAX_HISTORY_ITEMS),
-            )
-            cur.execute(
-                "UPDATE sessions SET last_active = now(), "
-                "turn_count = (SELECT COUNT(*)/2 FROM history WHERE session_id = %s) "
-                "WHERE session_id = %s",
-                (session_id, session_id),
-            )
+        with metrics.timed_db_query("postgres", "append_history"):
+            with _get_conn() as cur:
+                cur.execute(
+                    "INSERT INTO history (session_id, role, text, created_at) VALUES (%s, %s, %s, now())",
+                    (session_id, role, text),
+                )
+                cur.execute(
+                    "DELETE FROM history WHERE session_id = %s AND id NOT IN "
+                    "(SELECT id FROM history WHERE session_id = %s ORDER BY id DESC LIMIT %s)",
+                    (session_id, session_id, MAX_HISTORY_ITEMS),
+                )
+                cur.execute(
+                    "UPDATE sessions SET last_active = now(), "
+                    "turn_count = (SELECT COUNT(*)/2 FROM history WHERE session_id = %s) "
+                    "WHERE session_id = %s",
+                    (session_id, session_id),
+                )
 
     def get_history(self, session_id: str) -> list[dict]:
-        with _get_conn() as cur:
-            cur.execute(
-                "SELECT role, text, created_at AS timestamp FROM history "
-                "WHERE session_id = %s ORDER BY id ASC",
-                (session_id,),
-            )
-            return _rows(cur.fetchall())
+        with metrics.timed_db_query("postgres", "get_history"):
+            with _get_conn() as cur:
+                cur.execute(
+                    "SELECT role, text, created_at AS timestamp FROM history "
+                    "WHERE session_id = %s ORDER BY id ASC",
+                    (session_id,),
+                )
+                return _rows(cur.fetchall())
 
     def history_context(self, session_id: str) -> Optional[str]:
         history = self.get_history(session_id)
@@ -205,62 +212,74 @@ class SessionStore:
         return "\n".join(f"{h['role'].capitalize()}: {h['text']}" for h in history)
 
     def add_document(self, session_id: str, file_id: str, original_name: str, size_bytes: int) -> None:
-        with _get_conn() as cur:
-            cur.execute(
-                "INSERT INTO documents (file_id, session_id, original_name, size_bytes, status, uploaded_at) "
-                "VALUES (%s, %s, %s, %s, 'indexed', now()) ON CONFLICT (file_id) DO NOTHING",
-                (file_id, session_id, original_name, size_bytes),
-            )
+        with metrics.timed_db_query("postgres", "add_document"):
+            with _get_conn() as cur:
+                cur.execute(
+                    "INSERT INTO documents (file_id, session_id, original_name, size_bytes, status, uploaded_at) "
+                    "VALUES (%s, %s, %s, %s, 'indexed', now()) ON CONFLICT (file_id) DO NOTHING",
+                    (file_id, session_id, original_name, size_bytes),
+                )
 
     def list_documents(self, session_id: str) -> list[dict]:
-        with _get_conn() as cur:
-            cur.execute(
-                "SELECT file_id, original_name, size_bytes, status, uploaded_at "
-                "FROM documents WHERE session_id = %s ORDER BY uploaded_at DESC",
-                (session_id,),
-            )
-            return _rows(cur.fetchall())
+        with metrics.timed_db_query("postgres", "list_documents"):
+            with _get_conn() as cur:
+                cur.execute(
+                    "SELECT file_id, original_name, size_bytes, status, uploaded_at "
+                    "FROM documents WHERE session_id = %s ORDER BY uploaded_at DESC",
+                    (session_id,),
+                )
+                return _rows(cur.fetchall())
 
     def has_documents(self, session_id: str) -> bool:
-        with _get_conn() as cur:
-            cur.execute("SELECT 1 FROM documents WHERE session_id = %s LIMIT 1", (session_id,))
-            return cur.fetchone() is not None
+        with metrics.timed_db_query("postgres", "has_documents"):
+            with _get_conn() as cur:
+                cur.execute("SELECT 1 FROM documents WHERE session_id = %s LIMIT 1", (session_id,))
+                return cur.fetchone() is not None
 
     def delete_document(self, session_id: str, file_id: str) -> bool:
-        with _get_conn() as cur:
-            cur.execute(
-                "DELETE FROM documents WHERE session_id = %s AND file_id = %s",
-                (session_id, file_id),
-            )
-            return cur.rowcount > 0
+        with metrics.timed_db_query("postgres", "delete_document"):
+            with _get_conn() as cur:
+                cur.execute(
+                    "DELETE FROM documents WHERE session_id = %s AND file_id = %s",
+                    (session_id, file_id),
+                )
+                return cur.rowcount > 0
 
     def get_session_info(self, session_id: str) -> Optional[dict]:
-        with _get_conn() as cur:
-            cur.execute(
-                "SELECT session_id, created_at, last_active, turn_count "
-                "FROM sessions WHERE session_id = %s",
-                (session_id,),
-            )
-            row = cur.fetchone()
-            return dict(row) if row else None
+        with metrics.timed_db_query("postgres", "get_session_info"):
+            with _get_conn() as cur:
+                cur.execute(
+                    "SELECT session_id, created_at, last_active, turn_count "
+                    "FROM sessions WHERE session_id = %s",
+                    (session_id,),
+                )
+                row = cur.fetchone()
+                return dict(row) if row else None
 
     def list_sessions(self) -> list[dict]:
-        with _get_conn() as cur:
-            cur.execute(
-                "SELECT session_id, created_at, last_active, turn_count "
-                "FROM sessions ORDER BY last_active DESC"
-            )
-            return _rows(cur.fetchall())
+        with metrics.timed_db_query("postgres", "list_sessions"):
+            with _get_conn() as cur:
+                cur.execute(
+                    "SELECT session_id, created_at, last_active, turn_count "
+                    "FROM sessions ORDER BY last_active DESC"
+                )
+                return _rows(cur.fetchall())
 
     def delete_session(self, session_id: str) -> None:
-        with _get_conn() as cur:
-            cur.execute("DELETE FROM sessions WHERE session_id = %s", (session_id,))
+        with metrics.timed_db_query("postgres", "delete_session"):
+            with _get_conn() as cur:
+                cur.execute("DELETE FROM sessions WHERE session_id = %s", (session_id,))
+        metrics.ACTIVE_SESSIONS.dec()
 
     def cleanup_inactive(self, max_age_minutes: int = 60) -> int:
         cutoff = (datetime.now(timezone.utc) - timedelta(minutes=max_age_minutes)).isoformat()
-        with _get_conn() as cur:
-            cur.execute("DELETE FROM sessions WHERE last_active < %s", (cutoff,))
-            return cur.rowcount
+        with metrics.timed_db_query("postgres", "cleanup_inactive"):
+            with _get_conn() as cur:
+                cur.execute("DELETE FROM sessions WHERE last_active < %s", (cutoff,))
+                removed = cur.rowcount
+        if removed:
+            metrics.ACTIVE_SESSIONS.dec(removed)
+        return removed
 
 
 session_store = SessionStore()

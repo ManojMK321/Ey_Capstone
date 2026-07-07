@@ -9,6 +9,7 @@ from openai import OpenAI
 
 from src.agents.agentic_rag import AgenticRAG
 from src.observability.langsmith import traceable_operation
+from src.observability import metrics
 from src.agents.intent_detection import IntentDetector, Workflow
 from src.agents.knowledge_rag import KnowledgeRAG
 from src.orchestrator.session_store_postgres import SessionStore
@@ -119,77 +120,103 @@ async def chat_documents(request: ChatRequest) -> ChatResponse:
             detail="Query text cannot be empty.",
         )
 
-    session_id = session_man.make_session(request.session_id, request.reset_session)
-    history_context = session_man.history_context(session_id)
-    session_man.append_history(session_id, "user", query)
+    overall_start = time.perf_counter()
+    workflow_type = "unknown"
+    model_used = "unknown"
+    usage: dict = {}
 
-    vector_store = get_vector_store()
-    if getattr(vector_store, "vector_store", None) is None:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="No indexed documents are available. Upload a PDF first via POST /upload/.",
-        )
+    try:
+        session_id = session_man.make_session(request.session_id, request.reset_session)
+        history_context = session_man.history_context(session_id)
+        session_man.append_history(session_id, "user", query)
 
-    intent_detector, knowledge_rag, agentic_rag = _get_agents()
-
-    start = time.perf_counter()
-    intent = intent_detector.detect(query)
-    logger.info(
-        "Intent detected: %s (%.2f) — %s",
-        intent.workflow.value, intent.confidence, intent.reason,
-    )
-
-    if intent.workflow == Workflow.KNOWLEDGE_RAG:
-        retrieval_result = knowledge_rag.retrieve(query)
-        if isinstance(retrieval_result, tuple):
-            docs, _ = retrieval_result
-        else:
-            docs = retrieval_result
-
-        if not docs:
+        vector_store = get_vector_store()
+        if getattr(vector_store, "vector_store", None) is None:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
-                detail="No relevant document chunks found for the query.",
+                detail="No indexed documents are available. Upload a PDF first via POST /upload/.",
             )
-        sources, source_payload = _build_sources(docs)
-        llm_start = time.perf_counter()
-        answer = knowledge_rag.answer(query, source_payload, history_context)
-        llm_latency_ms = (time.perf_counter() - llm_start) * 1000
-        usage = knowledge_rag.last_usage
-    else:
-        llm_start = time.perf_counter()
-        agent_result = agentic_rag.run(query, history_context)
-        llm_latency_ms = (time.perf_counter() - llm_start) * 1000
-        answer = agent_result.get("answer", "")
-        usage = {
-            "input_tokens":  agent_result.get("input_tokens", 0),
-            "output_tokens": agent_result.get("output_tokens", 0),
-        }
-        docs = []
-        for item in agent_result.get("retrieved", []):
-            docs.extend(item.get("docs", []))
-        sources, source_payload = _build_sources(docs)
 
-    elapsed = time.perf_counter() - start
-    logger.info(
-        "Query answered in %.2fs. intent=%s sources=%d",
-        elapsed, intent.workflow.value, len(sources),
-    )
+        intent_detector, knowledge_rag, agentic_rag = _get_agents()
 
-    session_man.append_history(session_id, "assistant", answer)
-    return ChatResponse(
-        session_id=session_id,
-        query=query,
-        answer=answer,
-        sources=sources,
-        chunks=source_payload,
-        intent=intent.workflow.value,
-        intent_reason=intent.reason,
-        intent_confidence=intent.confidence,
-        llm_latency_ms=llm_latency_ms,
-        input_tokens=usage.get("input_tokens", 0),
-        output_tokens=usage.get("output_tokens", 0),
+        start = time.perf_counter()
+        intent = intent_detector.detect(query)
+        workflow_type = intent.workflow.value
+        logger.info(
+            "Intent detected: %s (%.2f) — %s",
+            intent.workflow.value, intent.confidence, intent.reason,
+        )
+
+        if intent.workflow == Workflow.KNOWLEDGE_RAG:
+            model_used = knowledge_rag.model
+            retrieval_result = knowledge_rag.retrieve(query)
+            if isinstance(retrieval_result, tuple):
+                docs, _ = retrieval_result
+            else:
+                docs = retrieval_result
+
+            if not docs:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="No relevant document chunks found for the query.",
+                )
+            sources, source_payload = _build_sources(docs)
+            llm_start = time.perf_counter()
+            answer = knowledge_rag.answer(query, source_payload, history_context)
+            llm_latency_ms = (time.perf_counter() - llm_start) * 1000
+            usage = knowledge_rag.last_usage
+        else:
+            model_used = agentic_rag.model
+            llm_start = time.perf_counter()
+            agent_result = agentic_rag.run(query, history_context)
+            llm_latency_ms = (time.perf_counter() - llm_start) * 1000
+            answer = agent_result.get("answer", "")
+            usage = {
+                "input_tokens":  agent_result.get("input_tokens", 0),
+                "output_tokens": agent_result.get("output_tokens", 0),
+            }
+            docs = []
+            for item in agent_result.get("retrieved", []):
+                docs.extend(item.get("docs", []))
+            sources, source_payload = _build_sources(docs)
+
+        elapsed = time.perf_counter() - start
+        logger.info(
+            "Query answered in %.2fs. intent=%s sources=%d",
+            elapsed, intent.workflow.value, len(sources),
+        )
+
+        session_man.append_history(session_id, "assistant", answer)
+        metrics.CHAT_HISTORY_SIZE.observe(len(session_man.get_history(session_id)))
+        response = ChatResponse(
+            session_id=session_id,
+            query=query,
+            answer=answer,
+            sources=sources,
+            chunks=source_payload,
+            intent=intent.workflow.value,
+            intent_reason=intent.reason,
+            intent_confidence=intent.confidence,
+            llm_latency_ms=llm_latency_ms,
+            input_tokens=usage.get("input_tokens", 0),
+            output_tokens=usage.get("output_tokens", 0),
+        )
+    except HTTPException as http_exc:
+        metrics.CHAT_ERRORS.labels(workflow_type=workflow_type, error_type=f"http_{http_exc.status_code}").inc()
+        raise
+    except Exception as exc:
+        metrics.CHAT_ERRORS.labels(workflow_type=workflow_type, error_type=type(exc).__name__).inc()
+        raise
+
+    metrics.record_chat_request(
+        workflow_type=workflow_type,
+        status="success",
+        duration=time.perf_counter() - overall_start,
+        tokens_used=usage.get("input_tokens", 0),
+        tokens_generated=usage.get("output_tokens", 0),
+        model=model_used,
     )
+    return response
 
 
 @traceable_operation(

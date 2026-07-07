@@ -1,5 +1,6 @@
 import asyncio
 import json
+import tempfile
 import uuid
 import logging
 from pathlib import Path
@@ -23,7 +24,11 @@ router = APIRouter()
 # Config
 # ---------------------------------------------------------------------------
 
-TEMP_DIR              = Path("temp_uploads")
+# Outside the project tree on purpose: uvicorn's --reload file watcher covers
+# the whole project directory, and every create/delete here was slipping past
+# reload_excludes and restarting the worker mid-upload — killing whatever
+# request was in flight during the slowest step (embedding + indexing).
+TEMP_DIR              = Path(tempfile.gettempdir()) / "contract_intelligence_uploads"
 ALLOWED_EXTENSIONS    = {".pdf"}
 ALLOWED_CONTENT_TYPES = {"application/pdf", "application/octet-stream", "binary/octet-stream"}
 MAX_FILE_SIZE_MB      = 50

@@ -2,6 +2,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from src.api.upload_api import router as upload_router
 from src.api.chat import router as chat_router
+from docs.pipeline import get_pipeline
 import uvicorn
 import logging
 
@@ -18,6 +19,18 @@ app = FastAPI(
     docs_url="/docs",
     redoc_url="/redoc",
 )
+
+
+@app.on_event("startup")
+def _warm_up_ingestion_pipeline() -> None:
+    # get_pipeline() is a lazy singleton — without this, the heavy
+    # langchain/pinecone imports and the first network round trip to
+    # OpenAI/Pinecone happen on whichever user's upload request arrives
+    # first, making that upload look stuck for up to a minute. Paying that
+    # cost once at startup keeps every real upload fast.
+    logger.info("Warming up ingestion pipeline...")
+    get_pipeline()
+    logger.info("Ingestion pipeline warm.")
 
 app.add_middleware(
     CORSMiddleware,
@@ -36,10 +49,13 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=8000,
         reload=True,
-        # Uploads write to temp_uploads/ and the session store writes to
-        # sessions.db mid-request; without these excludes the reload watcher
-        # treats its own runtime writes as a source change and restarts the
-        # worker, silently killing whatever request was in flight.
-        reload_excludes=["temp_uploads/*", "sessions.db", "*.log"],
+        # Scoped on purpose: with no reload_dirs, uvicorn watches the whole
+        # project root, including venv/ (70k+ files). watchfiles then has to
+        # continuously monitor that entire tree — reload_excludes only
+        # filters which changes *trigger* a reload, it doesn't stop the
+        # watching itself — and that constant I/O was starving the Pinecone
+        # upsert call during uploads, turning a ~2s call into 60-80s.
+        reload_dirs=["src", "docs"],
+        reload_excludes=["sessions.db", "*.log"],
         log_level="info",
     )

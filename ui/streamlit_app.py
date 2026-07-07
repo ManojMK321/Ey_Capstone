@@ -616,11 +616,7 @@ def _ragas_metrics_html(score) -> str:
         f'letter-spacing:.05em;margin-top:3px;">{label}</div></div>'
         for label, v in metrics
     )
-    return (
-        f'<div style="font-size:10px;color:#26C6DA;font-weight:600;text-transform:uppercase;'
-        f'letter-spacing:.06em;margin:10px 0 6px;">RAGAS · judged by GPT-4o mini</div>'
-        f'<div style="display:flex;gap:10px;margin-bottom:10px;">{cards}</div>'
-    )
+    return f'<div style="display:flex;gap:10px;margin-bottom:10px;">{cards}</div>'
 
 
 def _ragas_chunks_html(chunks: list) -> str:
@@ -1059,14 +1055,14 @@ elif st.session_state.screen == "chat":
             if msg["role"] == "assistant":
                 st.markdown('<div class="eval-btn">', unsafe_allow_html=True)
                 if st.button(
-                    "📊 Evaluate (RAGAS · GPT-4o mini)",
+                    "📊 Evaluate RAGAS",
                     key=f"eval_{active_key}_{msg_idx}",
                 ):
                     question_text = messages[msg_idx - 1]["content"]
                     contexts = [
                         c.get("content", "") for c in msg.get("chunks", []) if c.get("content")
                     ]
-                    with st.spinner("Judging with GPT-4o mini…"):
+                    with st.spinner("Scoring…"):
                         try:
                             msg["ragas_score"] = score_turn(question_text, msg["content"], contexts)
                             msg["ragas_error"] = None

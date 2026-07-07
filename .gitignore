@@ -8,3 +8,11 @@ faiss_index/
 temp_uploads/
 *.egg-info/
 .DS_Store
+
+# load_test_*.py / load_testing.py run output — regenerated per run, may
+# contain session IDs and query text from whatever was tested locally.
+chat_results.json
+rag_results.json
+upload_results.json
+chat_combined.json
+upload_combined.json

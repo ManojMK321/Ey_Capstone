@@ -1,0 +1,63 @@
+# ── Python 3.12 required ──────────────────────────────────────────────────────
+# langchain-pinecone does not support Python 3.14+
+# Use: py -3.12 -m venv .venv
+
+# ── Vector store (FAISS — local, no credentials required) ────────────────────
+faiss-cpu>=1.7.4
+langchain-community>=0.2.0
+
+# ── Retrieval ─────────────────────────────────────────────────────────────────
+rank-bm25>=0.2.2
+sentence-transformers>=2.7.0
+numpy>=1.26.4                  # 2.x required on Python 3.14+
+
+# ── LangChain ─────────────────────────────────────────────────────────────────
+langchain>=0.2.0
+langchain-community>=0.2.0
+langchain-openai>=0.1.0
+langchain-core>=0.2.0
+langchain-text-splitters>=0.2.0
+
+# ── OpenAI ────────────────────────────────────────────────────────────────────
+openai>=1.3.0
+
+# ── PDF parsing ───────────────────────────────────────────────────────────────
+pypdf>=3.17.0
+
+# ── FastAPI ───────────────────────────────────────────────────────────────────
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0
+python-multipart>=0.0.9
+pydantic>=2.0.0
+
+# ── PostgreSQL (session store) ────────────────────────────────────────────────
+psycopg2-binary>=2.9.9
+
+# ── Azure ─────────────────────────────────────────────────────────────────────
+azure-storage-blob>=12.19.0
+azure-identity>=1.15.0
+
+# ── RAG evaluation (backend/eval/, also imported in-process by the frontend) ─
+ragas>=0.1.0
+datasets>=2.14.0
+
+# ── Utils ─────────────────────────────────────────────────────────────────────
+python-dotenv>=1.0.0
+langsmith>=0.9.0
+
+# ── Observability (Prometheus metrics + OpenTelemetry tracing) ───────────────
+prometheus-client>=0.20.0
+prometheus-fastapi-instrumentator>=7.0.0
+opentelemetry-sdk>=1.24.0
+opentelemetry-exporter-otlp-proto-grpc>=1.24.0   # optional — only needed if OTEL_EXPORTER_OTLP_ENDPOINT is set
+
+# ── Jupyter ───────────────────────────────────────────────────────────────────
+jupyter>=1.0.0
+nbformat>=5.9.0
+
+# ── Testing ───────────────────────────────────────────────────────────────────
+pytest>=8.0.0
+httpx>=0.27.0
+
+# ── Load testing (load_test_*.py, load_testing.py) ───────────────────────────
+aiohttp>=3.9.0

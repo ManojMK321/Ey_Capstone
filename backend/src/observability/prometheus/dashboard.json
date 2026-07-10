@@ -1,0 +1,204 @@
+{
+  "title": "App Observability — Golden Signals & LLM/RAG",
+  "uid": "app-observability",
+  "schemaVersion": 39,
+  "version": 1,
+  "timezone": "browser",
+  "refresh": "30s",
+  "time": { "from": "now-6h", "to": "now" },
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": {}
+      },
+      {
+        "name": "endpoint",
+        "type": "query",
+        "datasource": "${datasource}",
+        "query": "label_values(http_requests_total, handler)",
+        "includeAll": true,
+        "multi": true,
+        "refresh": 2
+      },
+      {
+        "name": "model",
+        "type": "query",
+        "datasource": "${datasource}",
+        "query": "label_values(llm_call_duration_seconds_bucket, model)",
+        "includeAll": true,
+        "multi": true,
+        "refresh": 2
+      }
+    ]
+  },
+  "panels": [
+    { "id": 1, "type": "row", "title": "Traffic & Errors", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 } },
+    {
+      "id": 2, "type": "timeseries", "title": "HTTP request rate (req/s)",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 1 },
+      "datasource": "${datasource}",
+      "targets": [
+        { "expr": "sum(rate(http_requests_total{handler=~\"$endpoint\"}[5m])) by (handler, status)", "legendFormat": "{{handler}} {{status}}" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "reqps" }, "overrides": [] }
+    },
+    {
+      "id": 3, "type": "timeseries", "title": "HTTP error rate (5xx / total)",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 1 },
+      "datasource": "${datasource}",
+      "targets": [
+        { "expr": "sum(rate(http_requests_total{status=~\"5..\"}[5m])) / sum(rate(http_requests_total[5m]))", "legendFormat": "error ratio" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "percentunit", "max": 1, "min": 0 }, "overrides": [] }
+    },
+    {
+      "id": 4, "type": "timeseries", "title": "HTTP latency p50 / p95 / p99",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 1 },
+      "datasource": "${datasource}",
+      "targets": [
+        { "expr": "histogram_quantile(0.50, sum(rate(http_request_duration_seconds_bucket[5m])) by (le))", "legendFormat": "p50" },
+        { "expr": "histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket[5m])) by (le))", "legendFormat": "p95" },
+        { "expr": "histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket[5m])) by (le))", "legendFormat": "p99" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] }
+    },
+    {
+      "id": 5, "type": "stat", "title": "In-progress requests",
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 9 },
+      "datasource": "${datasource}",
+      "targets": [{ "expr": "sum(http_requests_inprogress)" }]
+    },
+    {
+      "id": 6, "type": "stat", "title": "Active sessions",
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 9 },
+      "datasource": "${datasource}",
+      "targets": [{ "expr": "sum(active_sessions)" }]
+    },
+    {
+      "id": 7, "type": "stat", "title": "Cache hit ratio",
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 9 },
+      "datasource": "${datasource}",
+      "fieldConfig": { "defaults": { "unit": "percentunit" }, "overrides": [] },
+      "targets": [{ "expr": "avg(cache_hit_ratio)" }]
+    },
+    {
+      "id": 8, "type": "stat", "title": "System health (component)",
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 9 },
+      "datasource": "${datasource}",
+      "targets": [{ "expr": "min(system_health_status)" }]
+    },
+
+    { "id": 10, "type": "row", "title": "Chat / Agent Pipeline", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 13 } },
+    {
+      "id": 11, "type": "timeseries", "title": "Chat requests by workflow type",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 14 },
+      "datasource": "${datasource}",
+      "targets": [{ "expr": "sum(rate(chat_requests_total[5m])) by (workflow_type, status)", "legendFormat": "{{workflow_type}} {{status}}" }]
+    },
+    {
+      "id": 12, "type": "timeseries", "title": "Chat processing duration p95 by workflow",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 14 },
+      "datasource": "${datasource}",
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "targets": [{ "expr": "histogram_quantile(0.95, sum(rate(chat_processing_duration_seconds_bucket[5m])) by (le, workflow_type))", "legendFormat": "{{workflow_type}}" }]
+    },
+    {
+      "id": 13, "type": "timeseries", "title": "Agent step duration p95 by step",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 14 },
+      "datasource": "${datasource}",
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "targets": [{ "expr": "histogram_quantile(0.95, sum(rate(agent_step_duration_seconds_bucket[5m])) by (le, agent_type, step_name))", "legendFormat": "{{agent_type}}/{{step_name}}" }]
+    },
+    {
+      "id": 14, "type": "timeseries", "title": "Chat error rate by type",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 22 },
+      "datasource": "${datasource}",
+      "targets": [{ "expr": "sum(rate(chat_errors_total[5m])) by (workflow_type, error_type)", "legendFormat": "{{workflow_type}}/{{error_type}}" }]
+    },
+    {
+      "id": 15, "type": "timeseries", "title": "Agent invocations by status",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 22 },
+      "datasource": "${datasource}",
+      "targets": [{ "expr": "sum(rate(agent_invocations_total[5m])) by (agent_type, status)", "legendFormat": "{{agent_type}}/{{status}}" }]
+    },
+
+    { "id": 20, "type": "row", "title": "LLM Calls & Tokens", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 30 } },
+    {
+      "id": 21, "type": "timeseries", "title": "LLM call latency p95 by model",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 31 },
+      "datasource": "${datasource}",
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "targets": [{ "expr": "histogram_quantile(0.95, sum(rate(llm_call_duration_seconds_bucket{model=~\"$model\"}[5m])) by (le, model))", "legendFormat": "{{model}}" }]
+    },
+    {
+      "id": 22, "type": "timeseries", "title": "LLM error rate by model",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 31 },
+      "datasource": "${datasource}",
+      "targets": [{ "expr": "sum(rate(llm_call_errors_total[5m])) by (model, error_code)", "legendFormat": "{{model}}/{{error_code}}" }]
+    },
+    {
+      "id": 23, "type": "timeseries", "title": "Token throughput (consumed vs generated)",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 31 },
+      "datasource": "${datasource}",
+      "targets": [
+        { "expr": "sum(rate(chat_tokens_consumed_total[5m])) by (model)", "legendFormat": "consumed:{{model}}" },
+        { "expr": "sum(rate(chat_tokens_generated_total[5m])) by (model)", "legendFormat": "generated:{{model}}" }
+      ]
+    },
+
+    { "id": 30, "type": "row", "title": "Retrieval & Data Layer", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 39 } },
+    {
+      "id": 31, "type": "timeseries", "title": "Vector store query latency p95",
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 40 },
+      "datasource": "${datasource}",
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "targets": [{ "expr": "histogram_quantile(0.95, sum(rate(vector_store_query_duration_seconds_bucket[5m])) by (le, store_type, operation))", "legendFormat": "{{store_type}}/{{operation}}" }]
+    },
+    {
+      "id": 32, "type": "timeseries", "title": "Documents retrieved per query (avg)",
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 40 },
+      "datasource": "${datasource}",
+      "targets": [{ "expr": "sum(rate(documents_retrieved_sum[5m])) by (store_type) / sum(rate(documents_retrieved_count[5m])) by (store_type)", "legendFormat": "{{store_type}}" }]
+    },
+    {
+      "id": 33, "type": "timeseries", "title": "DB query latency p95 by operation",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 40 },
+      "datasource": "${datasource}",
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "targets": [{ "expr": "histogram_quantile(0.95, sum(rate(db_query_duration_seconds_bucket[5m])) by (le, query_type, operation))", "legendFormat": "{{query_type}}/{{operation}}" }]
+    },
+    {
+      "id": 34, "type": "timeseries", "title": "Document upload processing time p95 by stage",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 48 },
+      "datasource": "${datasource}",
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "targets": [{ "expr": "histogram_quantile(0.95, sum(rate(document_processing_duration_seconds_bucket[5m])) by (le, file_type, stage))", "legendFormat": "{{file_type}}/{{stage}}" }]
+    },
+    {
+      "id": 35, "type": "timeseries", "title": "Upload & DB error rate",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 48 },
+      "datasource": "${datasource}",
+      "targets": [
+        { "expr": "sum(rate(upload_errors_total[5m])) by (file_type, error_type)", "legendFormat": "upload:{{file_type}}/{{error_type}}" },
+        { "expr": "sum(rate(db_errors_total[5m])) by (query_type, error_type)", "legendFormat": "db:{{query_type}}/{{error_type}}" }
+      ]
+    },
+
+    { "id": 40, "type": "row", "title": "Saturation", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 56 } },
+    {
+      "id": 41, "type": "timeseries", "title": "Queue depth by queue",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 57 },
+      "datasource": "${datasource}",
+      "targets": [{ "expr": "queue_depth", "legendFormat": "{{queue_name}}" }]
+    },
+    {
+      "id": 42, "type": "timeseries", "title": "Chat history size distribution (avg)",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 57 },
+      "datasource": "${datasource}",
+      "targets": [{ "expr": "rate(chat_history_size_sum[5m]) / rate(chat_history_size_count[5m])" }]
+    }
+  ]
+}

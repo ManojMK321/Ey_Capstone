@@ -1,0 +1,9 @@
+# ── Streamlit UI ──────────────────────────────────────────────────────────────
+streamlit>=1.32.0
+pillow>=7.1.0,<13             # streamlit requires pillow; pin range for compat
+requests
+python-dotenv
+
+# ── RAGAS scoring (backend/eval/ragas_judge.py, imported in-process) ─────────
+openai>=1.3.0
+numpy>=1.26.4

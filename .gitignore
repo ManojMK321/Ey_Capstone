@@ -16,3 +16,7 @@ rag_results.json
 upload_results.json
 chat_combined.json
 upload_combined.json
+
+# guardrails/audit_logger.py output — regenerated per run, contains query
+# text and session IDs from whatever was processed locally.
+backend/logs/

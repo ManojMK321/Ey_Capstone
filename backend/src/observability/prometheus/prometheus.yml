@@ -1,0 +1,38 @@
+# Prometheus scrape configuration.
+#
+# Run alongside your app:
+#   docker run -p 9090:9090 -v $PWD/src/observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml prom/prometheus
+#
+# Then import src/observability/prometheus/dashboard.json into Grafana,
+# pointing at this Prometheus instance as the datasource.
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    environment: production
+
+# --- Alerting (optional) -----------------------------------------------------
+# alerting:
+#   alertmanagers:
+#     - static_configs:
+#         - targets: ["alertmanager:9093"]
+# rule_files:
+#   - "alerts.yml"
+
+scrape_configs:
+  # Your FastAPI app, running on the host via `uvicorn main:app --port 8000`.
+  # From inside the Prometheus container, the host is reachable at
+  # host.docker.internal (works on Docker Desktop / Mac / Windows; on native
+  # Linux Docker, extra_hosts in docker-compose.yml maps this for you too).
+  - job_name: "app"
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["host.docker.internal:8000"]
+        labels:
+          service: "contract-intelligence-api"
+
+  # Prometheus scraping itself, useful for self-monitoring dashboards.
+  - job_name: "prometheus"
+    static_configs:
+      - targets: ["localhost:9090"]
